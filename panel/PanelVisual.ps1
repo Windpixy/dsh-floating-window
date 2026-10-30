@@ -338,14 +338,56 @@ function New-TaskRow {
     [void]$actions.Children.Add($btnReject)
     [void]$actions.Children.Add($btnAllow)
 
-    # 第二行：当前在做什么
+    # 第二行：当前在做什么（左）+ 本次会话 Token（右）
+    #
+    # 【v0.10.0 用户拍板的方案 A1】
+    #   用户原话："看图，放到那个 4秒 的下方"，随后在 A1/A2/A3 里选了 A1 ——
+    #   Token 放在第二行**右侧**，"正在做什么"在左侧收窄。
+    #
+    # 【为什么不单独占第三行（A2）】
+    #   实测（PS 5.1 WPF，字号 12.5/11/11，行间距 2）：
+    #     现在两行：内容高 31.85，行高 52，余量 20.15
+    #     加第三行：内容高 47.82，余量只剩 4.18
+    #   余量 4px 太薄，字号/缩放一调就会被切掉，而且撑破会连带
+    #   六档高度公式 98+54N 和所有验收数据重跑。所以走 A1。
+    #
+    # 【为什么不改 $RowHeight】
+    #   A1 下内容高**仍是 31.85**（只是把一行拆成两列，行数没变），
+    #   52 一点不动，六档高度公式一个字都不用改。
+    #
+    # 【代价（用户已知并接受）】
+    #   "正在做什么"可用宽从 232 降到约 160（Token 约 64 宽 + 8 间距），
+    #   中文从约 18 字降到约 14 字，长命令会更早变省略号。
+    $line2 = New-Object System.Windows.Controls.Grid
+    $line2.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
+    # 左列吃掉剩余宽度，右列 Auto（Token 字符串变长时右列自己变宽）
+    [void]$line2.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $cdTok = New-Object System.Windows.Controls.ColumnDefinition
+    $cdTok.Width = [System.Windows.GridLength]::Auto
+    [void]$line2.ColumnDefinitions.Add($cdTok)
+    [void]$content.Children.Add($line2)
+
     $activity = New-UiText -Text '' -Size 11 -Brush (New-Brush $script:ColTextSecondary) `
         -Trim 'CharacterEllipsis'
-    $activity.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
-    [void]$content.Children.Add($activity)
+    # 必须 Stretch + 左列：否则文字块只按内容宽度占位，
+    # 截断（CharacterEllipsis）永远算在"够宽"的一侧，省略号不会出现。
+    $activity.VerticalAlignment = 'Center'
+    $activity.HorizontalAlignment = 'Stretch'
+    [System.Windows.Controls.Grid]::SetColumn($activity, 0)
+    [void]$line2.Children.Add($activity)
+
+    # Token 小字：字色和数据源由 Panel.ps1 的 Get-Row 统一挂（见那里的说明），
+    # 这里只给形状。字号跟 activity 一致（11）—— 比它小会掉到 10.5 档，
+    # 光晕参数会切到"更密"那一档，同一行里两种晕看着不一致。
+    $tokens = New-UiText -Text '' -Size 11 -Brush (New-Brush $script:ColTextSecondary) -Align 'Right'
+    $tokens.VerticalAlignment = 'Center'
+    $tokens.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+    [System.Windows.Controls.Grid]::SetColumn($tokens, 1)
+    [void]$line2.Children.Add($tokens)
 
     return [pscustomobject]@{
         Root = $g; Name = $name; Elapsed = $elapsed; Activity = $activity
+        Tokens = $tokens
         Actions = $actions; BtnAllow = $btnAllow; BtnReject = $btnReject
     }
 }

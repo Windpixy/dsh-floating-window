@@ -17,6 +17,8 @@ import {
   formatTimestamp,
   localDayKey,
 } from '../lib/state.js'
+// 子代理汇总结论需要真账本来算，所以这里引 TokenTracker（v0.10.0 起）
+import { TokenTracker } from '../lib/tokens.js'
 
 let passed = 0
 let failed = 0
@@ -342,8 +344,10 @@ test('snapshot 的现有字段结构和含义一个都没变', () => {
   // tasks 里原有字段的语义
   assert.equal(snap.tasks.running, 1, 'running = 主任务数，不含子代理')
   assert.equal(Array.isArray(snap.tasks.sessions), true)
-  assert.deepEqual(Object.keys(snap.tasks.sessions[0]).sort(), ['activity', 'elapsedSec', 'title'],
-    '每行的字段集合不能变，老卡片只认这三个')
+  assert.deepEqual(Object.keys(snap.tasks.sessions[0]).sort(), ['activity', 'elapsedSec', 'title', 'tokens'],
+    '老三个字段不能动；tokens 是 v0.10.0 新增的第 4 个（卡片行右侧那个数）')
+  assert.equal(typeof snap.tasks.sessions[0].tokens, 'number',
+    'tokens 必须是数字。写成 null/undefined 时字段集合那条仍会通过，但卡片会显示空白')
 
   // 新字段
   assert.equal(snap.tasks.subagentCount, 1, '只加了 1 个子代理，帮手数就是 1')
@@ -534,6 +538,182 @@ test('同一天不清零', () => {
   const cleared = s.resetDayIfNeeded(new Date('2026-10-27T23:00:00+08:00').getTime())
   assert.equal(cleared, false)
   assert.equal(s.todayTokens, 999)
+})
+
+// ================================================================ 会话级 Token
+group('会话级 Token（v0.10.0：卡片每行右侧那个数）')
+
+test('没接查询函数时，每行 tokens 一律是 0（不是 undefined）', () => {
+  const s = new CardState()
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  const row = s.snapshot({ now: T0 }).tasks.sessions[0]
+  assert.equal(row.tokens, 0, '默认必须是数字 0，不能是 undefined/null')
+  assert.equal(typeof row.tokens, 'number')
+})
+
+test('接上之后每行取自己那个会话的数，互不串味', () => {
+  const s = new CardState()
+  s.setSessionTokenSource((id) => ({ s1: 1234, s2: 5678 })[id] ?? 0)
+  s.sessionAdded({ sessionId: 's1', running: true, blank: false })
+  s.sessionTitle('s1', '甲任务')
+  s.sessionAdded({ sessionId: 's2', running: true, blank: false })
+  s.sessionTitle('s2', '乙任务')
+
+  const rows = s.snapshot({ now: T0 }).tasks.sessions
+  assert.equal(rows.length, 2)
+  // 按标题取，比按下标稳（同秒创建时排序相同，但按语义断言更清楚）
+  const byTitle = new Map(rows.map(r => [r.title, r.tokens]))
+  assert.equal(byTitle.get('甲任务'), 1234)
+  assert.equal(byTitle.get('乙任务'), 5678)
+  assert.deepEqual(rows.map(r => r.tokens).sort((x, y) => x - y), [1234, 5678],
+    '两个会话各拿自己的数')
+})
+
+test('查询函数返回脏值时不污染快照（兜底成 0）', () => {
+  const s = new CardState()
+  s.setSessionTokenSource(() => 'abc')
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  assert.equal(s.snapshot({ now: T0 }).tasks.sessions[0].tokens, 0)
+
+  s.setSessionTokenSource(() => NaN)
+  assert.equal(s.snapshot({ now: T0 }).tasks.sessions[0].tokens, 0)
+
+  s.setSessionTokenSource(() => -50)
+  assert.equal(s.snapshot({ now: T0 }).tasks.sessions[0].tokens, 0, '负数当 0')
+})
+
+test('查询函数抛异常也不能让整个快照崩掉', () => {
+  const s = new CardState()
+  s.setSessionTokenSource(() => { throw new Error('boom') })
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  const snap = s.snapshot({ now: T0 })
+  assert.equal(snap.tasks.sessions[0].tokens, 0, '最差只是这一行显示 0')
+  assert.equal(snap.tasks.running, 1, '其余数据照常输出')
+})
+
+test('查询来源用 undefined 回报缺失时，仍然输出数字 0（不能出现 undefined）', () => {
+  // 【这条测的是真实风险，不是凑数】
+  //   _tokensOfSession 里走的是 Number(...)；如果来源函数返回 undefined，
+  //   Number(undefined) 是 NaN，会被兜底成 0。但万一有人把兜底删了，
+  //   JSON.stringify 会把 undefined 的键**直接丢掉**，卡片读到的是"没这个字段"，
+  //   于是那一行的 Token 时有时无 —— 正是文件头注释说要避免的现象。
+  const s = new CardState()
+  s.setSessionTokenSource(() => undefined)
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  const row = s.snapshot({ now: T0 }).tasks.sessions[0]
+  assert.equal(row.tokens, 0)
+  assert.equal('tokens' in row, true, '字段必须存在（JSON 里不能消失）')
+  assert.equal(JSON.parse(JSON.stringify(row)).tokens, 0, '落盘后仍然是一个数字 0')
+})
+
+test('小数会被取整（Token 是整数，卡片不该显示 1234.56）', () => {
+  const s = new CardState()
+  s.setSessionTokenSource(() => 1234.56)
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  assert.equal(s.snapshot({ now: T0 }).tasks.sessions[0].tokens, 1235)
+})
+
+// ================================================================ 子代理汇总
+//
+// 【这组是 2026-10-31 复核后补的 —— 本次改动最容易翻车的一点】
+//   子代理是独立会话，Token 记在它自己的 id 上，而卡片默认不显示子代理行。
+//   第一版只取主会话自己那份，结果：主任务 1500 + 子代理 3000000，
+//   卡片那行只显示 1500，底部却写今日 3001500 —— 用户会认为功能坏了。
+group('子代理的 Token 要算进它所属的任务行')
+
+test('主任务行 = 自己 + 名下所有子代理', () => {
+  const t = new TokenTracker({ dayStartMs: 0 })
+  t.beginBackfill()
+  t.addBackfill('main', 100, 1500)
+  t.addBackfill('child-1', 200, 2000000)
+  t.addBackfill('child-2', 300, 1000000)
+  t.endBackfill()
+
+  const s = new CardState({ showSubagentSessions: false })
+  s.setSessionTokenSource((sid) => t.sessionTotal(sid))
+  s.sessionAdded({ sessionId: 'main', running: true, blank: false })
+  s.sessionTitle('main', '主任务')
+  s.sessionAdded({ sessionId: 'child-1', running: true, blank: false, origin: 'subagent', parentSessionId: 'main' })
+  s.sessionAdded({ sessionId: 'child-2', running: true, blank: false, origin: 'subagent', parentSessionId: 'main' })
+
+  const rows = s.snapshot({ now: T0 }).tasks.sessions
+  assert.equal(rows.length, 1, '默认不显示子代理行')
+  assert.equal(rows[0].tokens, 3001500, '主任务行必须含子代理的量，否则 3M 无处显示')
+})
+
+test('子代理不会把别人的量算进来', () => {
+  const t = new TokenTracker({ dayStartMs: 0 })
+  t.beginBackfill()
+  t.addBackfill('a', 10, 100)
+  t.addBackfill('b', 20, 200)
+  t.endBackfill()
+
+  const s = new CardState({ showSubagentSessions: false })
+  s.setSessionTokenSource((sid) => t.sessionTotal(sid))
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  s.sessionAdded({ sessionId: 'b', running: true, blank: false })
+
+  const rows = s.snapshot({ now: T0 }).tasks.sessions
+  const vals = rows.map(r => r.tokens).sort((x, y) => x - y)
+  assert.deepEqual(vals, [100, 200], '两个互不相干的任务各拿自己的')
+})
+
+test('显示子代理行时，父行仍然汇总（开关不影响汇总口径）', () => {
+  const t = new TokenTracker({ dayStartMs: 0 })
+  t.beginBackfill()
+  t.addBackfill('main', 100, 1000)
+  t.addBackfill('kid', 200, 500)
+  t.endBackfill()
+
+  const s = new CardState({ showSubagentSessions: true })
+  s.setSessionTokenSource((sid) => t.sessionTotal(sid))
+  s.sessionAdded({ sessionId: 'main', running: true, blank: false })
+  s.sessionTitle('main', '主任务')
+  s.sessionAdded({ sessionId: 'kid', running: true, blank: false, origin: 'subagent', parentSessionId: 'main' })
+  s.sessionTitle('kid', '子代理')
+
+  const rows = s.snapshot({ now: T0 }).tasks.sessions
+  assert.equal(rows.length, 2)
+  const byTitle = new Map(rows.map(r => [r.title, r.tokens]))
+  assert.equal(byTitle.get('主任务'), 1500, '父行含子代理')
+  assert.equal(byTitle.get('子代理'), 500, '子代理行只算自己')
+})
+
+test('子代理会话已被淘汰时，父行不会崩（只是少算）', () => {
+  const t = new TokenTracker({ dayStartMs: 0 })
+  t.beginBackfill()
+  t.addBackfill('main', 100, 1000)
+  t.endBackfill()
+
+  const s = new CardState({ showSubagentSessions: false })
+  s.setSessionTokenSource((sid) => t.sessionTotal(sid))
+  s.sessionAdded({ sessionId: 'main', running: true, blank: false })
+  // 引用一个不在 sessions 表里的 parentSessionId，模拟脏数据
+  const rows = s.snapshot({ now: T0 }).tasks.sessions
+  assert.equal(rows[0].tokens, 1000)
+})
+
+test('tokens 是快照里每行的第 4 个字段（老三个原样保留）', () => {
+  const s = new CardState()
+  s.setSessionTokenSource(() => 42)
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  const row = s.snapshot({ now: T0 }).tasks.sessions[0]
+  assert.equal(row.tokens, 42)
+  assert.equal(typeof row.title, 'string')
+  assert.equal(typeof row.elapsedSec, 'number')
+  assert.equal(typeof row.activity, 'string')
+})
+
+test('反复调 snapshot 不会累加 tokens（必须是无副作用的纯读）', () => {
+  const s = new CardState()
+  let calls = 0
+  s.setSessionTokenSource(() => { calls++; return 100 })
+  s.sessionAdded({ sessionId: 'a', running: true, blank: false })
+  const a = s.snapshot({ now: T0 }).tasks.sessions[0].tokens
+  const b = s.snapshot({ now: T0 }).tasks.sessions[0].tokens
+  assert.equal(a, 100)
+  assert.equal(b, 100, '两次结果必须一样')
+  assert.ok(calls >= 2, '确实每次都向来源取值，但值不变')
 })
 
 test('localDayKey 格式', () => {

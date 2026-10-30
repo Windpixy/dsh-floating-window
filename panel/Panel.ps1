@@ -1397,6 +1397,25 @@ function Format-Tokens {
     return ("{0:N1}M" -f ($Value / 1000000.0))
 }
 
+# 任务行右下角那个"本次会话 Token"（v0.10.0）
+#
+# 【和 Format-Tokens 的区别：多带了"Token"这个单位词】
+#   底部那行是「今日 25.3M Token」，单位已经在句子里了；
+#   而任务行这个数字是孤零零一个小字，不写单位谁知道它是什么数。
+#   用户 2026-10-31 拍板要「12.3k Token」这个样式。
+#
+# 【为什么这里不计"0"出来】
+#   和上面 Format-Elapsed 的取法一致：数字拿不到（老插件、老 state.json、
+#   审批行、完成行）就返回空字符串，让控件自动塌成 0 宽、什么都不显示。
+#   显示 "0 Token" 会让人以为"这个任务真的一个 Token 都没用"，
+#   但更可能只是"这条数据本来就没有"，编一个 0 出来是误导。
+#   真的是 0（新会话刚开始）也走空字符串 —— 反正刚开跑时本来就没什么可看的。
+function Format-TaskTokens {
+    param([long]$Value)
+    if ($Value -le 0) { return '' }
+    return ((Format-Tokens $Value) + ' Token')
+}
+
 # ---------------------------------------------------------------- 读状态
 # state.json 结构（tasks.sessions 是新增的，缺了也能跑，只是只知道条数不知道明细）：
 # {
@@ -1479,7 +1498,37 @@ function Read-PanelState {
                 $title = [string](Get-Setting $s 'title' '未命名任务')
                 $el = [double](Get-Setting $s 'elapsedSec' 0)
                 $act = [string](Get-Setting $s 'activity' '')
-                [void]$out.Add([pscustomobject]@{ Title = $title; Elapsed = $el; Activity = $act })
+                # 【v0.10.0】这个任务今天用了多少 Token（插件 v0.10.0 起才有）。
+                #   注意：这是"任务"的量，含它派生出来的子代理会话（插件侧算好）。
+                #
+                # 【为什么必须走 Get-Setting，不能直接 $s.tokens】
+                #   老版本 state.json 里没有这个字段（用户插件没升级、或者
+                #   test/ 下那些脚本自己造的假 state.json 只有三个字段）。
+                #   直接 [long]$s.tokens 在字段缺失时取值是 $null，
+                #   转 [long] 有的情况下会抛异常，整行数据就被丢掉了 ——
+                #   表现是"卡片上任务名突然全没了"（和 v0.9.10 elapsedSec 同款坑）。
+                #   Get-Setting 缺字段返回默认值 0，最差只是这一行不显示 Token。
+                #
+                # 【为什么还要再包一层 try/catch】（2026-10-31 复核后补的）
+                #   Get-Setting 只解决"字段不存在"，解决不了"字段类型不对"。
+                #   实测 [long]'abc' 会抛；JSON 里写 1e+300 会被解析成 Double，
+                #   转 [long] 也会溢出抛异常。
+                #   而这个 foreach **外面没有** per-item 的 try/catch，只有最外层
+                #   读到 JSON 那一层的 catch —— 也就是说一条脏数据会中断整个
+                #   行列表的解析，卡片标题变成"读取状态出错"并一直停在那。
+                #   和 v0.9.10 给 elapsedSec 加兜底是同一个道理：最差显示 0，
+                #   不能让一条坏数据把整张卡片拖死。
+                $tok = [long]0
+                try {
+                    $tok = [long](Get-Setting $s 'tokens' 0)
+                    if ($tok -lt 0) { $tok = [long]0 }
+                }
+                catch {
+                    $tok = [long]0
+                }
+                [void]$out.Add([pscustomobject]@{
+                    Title = $title; Elapsed = $el; Activity = $act; Tokens = $tok
+                })
             }
             $tasks = $out.ToArray()
         }
@@ -5056,6 +5105,22 @@ function Get-Row {
         $r.Name.Foreground = $bTextPrimary
         $r.Elapsed.Foreground = $bTextSecondary
         $r.Activity.Foreground = $bTextSecondary
+        # 【v0.10.0】Token 小字也必须挂**共享画刷** $bTextSecondary（颜色用最弱的档）。
+        #
+        # 【为什么这一步不能省 —— 踩过同款坑】
+        #   New-TaskRow 里给控件建的是私有画刷（New-Brush $script:ColTextSecondary）。
+        #   而"深色壁纸变浅色壁纸时把字变深"这件事，是靠 Update-AdaptiveText
+        #   （约 2781-2797 行）去改 $bTextPrimary / $bTextSecondary / $bTextTertiary
+        #   这几个**共享画刷的颜色**实现的。私有画刷不在那张表里，改不到。
+        #   所以这里必须换成共享画刷，否则浅色壁纸上这串小字会是错的颜色 ——
+        #   而且完全不报错，只是"看着别扭"，和 v0.9.13 那个"日志说改过了、
+        #   界面其实没改"是同一种病。
+        #
+        # 【为什么用 $bTextSecondary 而不是更弱的 tertiary】
+        #   两个都是 v0.9.6 实测过对比度的档位（浅底 10.42 / 深底 13.94），
+        #   和旁边的"正在做什么"同色，整行视觉更齐。用最弱档会让这串小字
+        #   在磨砂上发虚，用户已经反馈过"小字可读性"问题。
+        $r.Tokens.Foreground = $bTextSecondary
         $r.Root.Visibility = 'Collapsed'
 
         # ---- 审批按钮的点击事件（v0.8.0）
@@ -5267,6 +5332,8 @@ function Set-TaskList {
                 Title = $State.tasks[$i].Title
                 Elapsed = (Format-Elapsed $State.tasks[$i].Elapsed)
                 Activity = $State.tasks[$i].Activity
+                # 【v0.10.0】这个任务自己今天用的 Token，显示在该行右下角。
+                Tokens = (Format-TaskTokens $State.tasks[$i].Tokens)
                 Accent = [System.Windows.Media.Color]::FromArgb(255, 0x2F, 0x6F, 0xE4)
             }
         }
@@ -5315,6 +5382,46 @@ function Set-TaskList {
         $r.Name.Text = [string]$rows[$i].Title
         $r.Elapsed.Text = [string]$rows[$i].Elapsed
         $r.Activity.Text = [string]$rows[$i].Activity
+
+        # 【v0.10.0】Token 小字。
+        #
+        # 【为什么用"字段在不在"判断，而不是直接取】
+        #   $rows 里的对象形状不止一种：运行中的行有 Tokens 字段，
+        #   而审批行 / 完成行 / "还有 N 个"溢出行**没有**这个字段。
+        #   PowerShell 对不存在的属性取值会返回 $null 且不报错（非 StrictMode），
+        #   所以直接取也行；但显式判断更明确，StrictMode 下也安全 ——
+        #   和本文件里读 $t.Elapsed 的写法保持一致（约 4987 行的说明）。
+        #
+        # 【为什么每次都要显式赋值，包括赋空字符串】
+        #   行是复用的（$script:rowPool）。上一帧是运行中的行、这一帧变成
+        #   审批行时，如果不显式清空，那串 Token 会**留在审批行上** ——
+        #   看起来像"这个待审批的操作花了 12.3k Token"，是错的。
+        #   Actions 插槽那段（下面）踩过一模一样的坑，注释里有记录。
+        #
+        # 【为什么要同时管 Visibility —— 这条是复核时实测出来的】
+        #   右列是 Auto 列，而一个"文本为空但可见"的 TextBlock 仍然带着
+        #   8 像素左边距，于是 Auto 列宽 = 8 而不是 0。
+        #   PS 5.1 + WPF 实测（232 可用宽）：
+        #     空文本、Visible  → 左列 224，右列 8   ← 白丢 8 像素
+        #     空文本、Collapsed → 左列 232，右列 0   ← 和改动前逐像素一致
+        #   也就是说，不设 Collapsed 的话，**所有没有 Token 的行**
+        #   （审批行、完成行、溢出行、以及刚开始跑还没用量的行）
+        #   都会比以前早一个字变成省略号 —— 那就违反了用户"其他 UI 一律不许动"。
+        #   所以这里文本和可见性必须一起设，不能只设文本。
+        $tokText = ''
+        if ($null -ne $rows[$i].PSObject.Properties['Tokens']) {
+            $tokText = [string]$rows[$i].Tokens
+        }
+        $r.Tokens.Text = $tokText
+        # 空 → Collapsed：不占位、不参与布局，activity 拿回满宽
+        # 非空 → Visible
+        if ([string]::IsNullOrEmpty($tokText)) {
+            $r.Tokens.Visibility = 'Collapsed'
+        }
+        else {
+            $r.Tokens.Visibility = 'Visible'
+        }
+
         $r.Root.Visibility = 'Visible'
 
         # ---- Actions 插槽（v0.8.0 悬浮窗审批）
@@ -5395,6 +5502,11 @@ function Set-TaskList {
         $r.Name.Text = ("还有 {0} 个任务" -f $overflow)
         $r.Elapsed.Text = ''
         $r.Activity.Text = ''
+        # 【v0.10.0】溢出行没有具体的会话，不能留着上一帧的 Token。
+        #   文本和可见性一起清 —— 只清文本的话那 8 像素左边距还在，
+        #   溢出行会比改动前更挤（见渲染循环里那段实测说明）。
+        $r.Tokens.Text = ''
+        $r.Tokens.Visibility = 'Collapsed'
         $r.Root.Visibility = 'Visible'
         $used++
     }

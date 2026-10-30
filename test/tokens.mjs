@@ -151,6 +151,217 @@ test('回填 0 金额也要记水位线（防止旧事件被实时算）', () =>
   assert.equal(t.addLive('s1', 150, 500), false, '旧事件必须跳过')
 })
 
+// ================================================================ 会话级账本
+group('会话级账本（v0.10.0：卡片每行显示自己那一份）')
+
+test('实时累加会同时记进会话账本', () => {
+  const t = mk()
+  t.addLive('s1', 10, 1000)
+  t.addLive('s1', 11, 500)
+  assert.equal(t.sessionTotal('s1'), 1500)
+  assert.equal(t.total(), 1500, '今日总额不受影响')
+})
+
+test('不同会话分开记，互不串味', () => {
+  const t = mk()
+  t.addLive('s1', 10, 1000)
+  t.addLive('s2', 5, 300)
+  t.addLive('s1', 11, 200)
+  assert.equal(t.sessionTotal('s1'), 1200)
+  assert.equal(t.sessionTotal('s2'), 300)
+  assert.equal(t.total(), 1500, '两个会话之和 = 今日总额')
+})
+
+test('没记录过的会话返回 0（不是 undefined）', () => {
+  const t = mk()
+  assert.equal(t.sessionTotal('nobody'), 0)
+  assert.equal(t.sessionTotal(''), 0)
+  assert.equal(t.sessionTotal(null), 0)
+  assert.equal(t.sessionTotal(undefined), 0)
+  assert.equal(typeof t.sessionTotal('nobody'), 'number')
+})
+
+test('回填的金额也记进会话（方案 B1，用户拍板）', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 100, 5000)
+  t.endBackfill()
+  assert.equal(t.sessionTotal('s1'), 5000, '启动时补回来的钱要算进这个会话')
+  assert.equal(t.total(), 5000)
+})
+
+test('回填 0 金额不会在会话账本里造出一条 0 记录', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 200, 0)
+  t.endBackfill()
+  assert.equal(t.sessionTotal('s1'), 0)
+  assert.equal(t.debug().sessionsPriced, 0, '没有金额就不占账本条目')
+  assert.equal(t.debug().sessionsTracked, 1, '但水位线还是要记（防旧事件被重复算）')
+})
+
+test('测试盲区补上：跨天时会话账本必须清空', () => {
+  const t = mk()
+  t.addLive('s1', 10, 1000)
+  t.addLive('s2', 5, 500)
+  assert.equal(t.sessionTotal('s1'), 1000)
+
+  const nextDay = new Date('2026-10-28T01:00:00+08:00').getTime()
+  assert.equal(t.rollover(nextDay), true)
+  assert.equal(t.sessionTotal('s1'), 0, '跨天后不能还挂着昨天的数')
+  assert.equal(t.sessionTotal('s2'), 0)
+  assert.equal(t.total(), 0)
+  assert.equal(t.debug().sessionsPriced, 0, '账本条目也要一起清掉')
+})
+
+test('同一天不跨天，会话账本保留', () => {
+  const t = mk()
+  t.addLive('s1', 10, 1000)
+  assert.equal(t.rollover(DAY + 3600_000), false)
+  assert.equal(t.sessionTotal('s1'), 1000)
+})
+
+test('水位线仍生效：被挡掉的实时事件不进会话账本', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 100, 5000)
+  t.endBackfill()
+
+  // seq=50 在回填覆盖范围内 → 必须跳过，会话账本也不能涨
+  assert.equal(t.addLive('s1', 50, 800), false)
+  assert.equal(t.sessionTotal('s1'), 5000, '被水位线挡下的钱不能重复记进会话')
+  assert.equal(t.total(), 5000)
+
+  // seq=101 是新的 → 要算，并且进会话
+  assert.equal(t.addLive('s1', 101, 800), true)
+  assert.equal(t.sessionTotal('s1'), 5800)
+  assert.equal(t.total(), 5800)
+})
+
+test('缓冲期事件按水位线筛完后才进会话账本', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 100, 5000)
+  t.addLive('s1', 50, 999)    // 会被挡
+  t.addLive('s1', 120, 300)   // 新的
+  t.addLive('brand-new', 5, 700)  // 回填时没这个会话
+
+  const r = t.endBackfill()
+  assert.equal(r.skipped, 1)
+  assert.equal(r.counted, 2)
+
+  assert.equal(t.sessionTotal('s1'), 5300, '5000 回填 + 300 新，999 被挡')
+  assert.equal(t.sessionTotal('brand-new'), 700)
+  assert.equal(t.total(), 6000)
+})
+
+test('每次调用 sessionTotal 不改变任何状态（纯读）', () => {
+  const t = mk()
+  t.addLive('s1', 10, 1000)
+  const a = t.sessionTotal('s1')
+  const b = t.sessionTotal('s1')
+  const c = t.sessionTotal('s1')
+  assert.equal(a, 1000)
+  assert.equal(b, 1000)
+  assert.equal(c, 1000)
+  assert.equal(t.total(), 1000, '反复读不能把总额读涨')
+})
+
+test('脏金额不进会话账本', () => {
+  const t = mk()
+  t.addLive('s1', 1, 0)
+  t.addLive('s1', 2, -100)
+  t.addLive('s1', 3, NaN)
+  t.addLive('s1', 4, 'abc')
+  assert.equal(t.sessionTotal('s1'), 0)
+})
+
+// ================================================================ 不变量
+//
+// 【这组是 2026-10-31 复核后补的】
+//   复核发现一个静默漏洞：会话号为空串时，addLive 会照加 _total，
+//   但 _addToSession 因为 `if (!id) return` 直接跳过了 —— 于是
+//   "各会话之和 = 今日总额"这条不变量被悄悄破坏，而且不报错。
+//   下面这几条就是守着这条不变量的。
+group('不变量：各会话之和 必须等于 今日总额')
+
+test('正常路径：Σ 各会话 = total()', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('a', 100, 5000)
+  t.addBackfill('b', 50, 3000)
+  t.endBackfill()
+  t.addLive('a', 101, 800)
+  t.addLive('c', 10, 200)
+  assert.equal(t.total(), 9000)
+  assert.equal(t.sessionSum(), 9000, '账本求和必须等于总额')
+})
+
+test('空会话号不再漏账：钱记进孤儿桶，总额和账本一致', () => {
+  const t = mk()
+  const ret = t.addLive('', 1, 500)
+  assert.equal(ret, true, '仍然算一笔真实的 Token，不能被丢弃')
+  assert.equal(t.total(), 500, '今日总额必须包含它（总额是校准过的权威值）')
+  assert.equal(t.sessionSum(), 500, '账本求和也必须包含它，否则不变量就破了')
+  assert.equal(t.sessionTotal(''), 0, '卡片永远不会去查空会话号，所以这笔不显示')
+  assert.equal(t.debug().sessionsPriced, 1, '孤儿桶算一个条目，但卡片查不到它')
+})
+
+test('回填期间空会话号走缓冲路径，同样不漏账', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addLive('', 5, 400)
+  const r = t.endBackfill()
+  assert.equal(r.counted, 1)
+  assert.equal(t.total(), 400)
+  assert.equal(t.sessionSum(), 400, '缓冲路径也不许漏账')
+})
+
+test('孤儿桶的钱不会混进任何真实会话', () => {
+  const t = mk()
+  t.addLive('', 1, 500)
+  t.addLive('s1', 2, 300)
+  assert.equal(t.sessionTotal('s1'), 300, '真实会话只能拿到自己那 300')
+  assert.equal(t.sessionSum(), 800)
+  assert.equal(t.total(), 800)
+})
+
+test('跨天后孤儿桶也清空', () => {
+  const t = mk()
+  t.addLive('', 1, 500)
+  t.addLive('s1', 2, 300)
+  const nextDay = new Date('2026-10-28T01:00:00+08:00').getTime()
+  assert.equal(t.rollover(nextDay), true)
+  assert.equal(t.sessionSum(), 0)
+  assert.equal(t.total(), 0)
+})
+
+test('debug 里 sessionSum 和 total 一致（排查时能一眼对上）', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('x', 10, 1111)
+  t.endBackfill()
+  t.addLive('y', 1, 2222)
+  t.addLive('', 2, 333)
+  const d = t.debug()
+  assert.equal(d.sessionSum, d.total, `sessionSum=${d.sessionSum} total=${d.total}`)
+})
+
+test('debug 的两个计数没有大小关系（复核纠错：能反过来）', () => {
+  // 原注释说 sessionsTracked >= sessionsPriced，实测能反过来：
+  // 回填之后新建的会话只有金额、没有水位线。
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('old', 100, 5000)
+  t.endBackfill()
+  t.addLive('brand-new', 5, 700)
+  const d = t.debug()
+  assert.equal(d.sessionsTracked, 1, '只有 old 有水位线')
+  assert.equal(d.sessionsPriced, 2, 'old 和 brand-new 都有金额')
+  assert.ok(d.sessionsTracked < d.sessionsPriced,
+    '确实能反过来 —— 所以注释里"前者>=后者"的说法是错的，已改')
+})
+
 // ================================================================ 跨天
 group('跨天清零')
 

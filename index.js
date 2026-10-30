@@ -117,6 +117,10 @@ export function apply(ctx, config) {
     showSubagentSessions: cfg.showSubagentSessions === true,
   })
   const tokens = new TokenTracker()
+  // 【v0.10.0】把"按会话查 Token"接到状态层，卡片每行才能显示自己那一份。
+  //   传的是函数而不是 TokenTracker 对象本身 —— state.js 刻意不依赖任何外部模块，
+  //   只认一个 (sessionId) => number 的纯函数（见 lib/state.js 的同名注释）。
+  state.setSessionTokenSource((sessionId) => tokens.sessionTotal(sessionId))
 
   const writer = new StateWriter({
     dir,
