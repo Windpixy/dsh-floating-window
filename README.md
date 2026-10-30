@@ -71,23 +71,16 @@
 
 ## 安装
 
-**先说清楚现状**：这个插件目前从 **GitHub** 装。npm 上还没发布（或者还没有你要的那个版本），
-所以方式二现在跑不通，等发布了再用。
+**已经发布到 npm 了**：<https://www.npmjs.com/package/dsh-floating-window>
 
-三种方式任选一种，效果一样。
+下面三种方式任选一种，效果一样。
 
 > **`<你的 profile>` 是什么？**
 > `profile` 就是"插件装到哪个配置夹里"的名字。
 > 打开 DSH，侧栏点「插件」，页面上能看到当前 profile 的名字。
 > 不确定就随便用一个你在用的名字，DSH 会在第一次使用时自动建好它。
 
-### 方式一：命令行，从 GitHub 装（现在就能用，推荐）
-
-```bash
-dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
-```
-
-### 方式二：命令行，从 npm 装（发布到 npm 之后可用）
+### 方式一：命令行，从 npm 装（推荐）
 
 ```bash
 dsh plugin --profile <你的 profile> add dsh-floating-window@0.9.15
@@ -109,6 +102,14 @@ dsh plugin --profile <你的 profile> add dsh-floating-window@0.9.15
 > 那个文件里本来就有一串这样的例外（都是之前手加的），照着加一行
 > `- dsh-floating-window` 就行。
 
+### 方式二：命令行，从 GitHub 装（不用 npm 的备选）
+
+```bash
+dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
+```
+
+> 这条路装的是仓库里的最新代码，没有版本号概念。网络访问 GitHub 慢的时候可以优先用方式一。
+
 ### 方式三：在 DSH 图形界面里装
 
 不想敲命令也可以：
@@ -116,8 +117,8 @@ dsh plugin --profile <你的 profile> add dsh-floating-window@0.9.15
 1. 打开 DSH，左侧栏点 **「插件」**
 2. 点 **「添加插件」**
 3. 在输入框里填下面任意一种：
-   - **Git 地址**：`github:Windpixy/dsh-floating-window` ← 现在能用的
-   - 包名：`dsh-floating-window@0.9.15` ← 等发布到 npm 之后才行
+   - **包名**：`dsh-floating-window@0.9.15` ← 推荐
+   - **Git 地址**：`github:Windpixy/dsh-floating-window`
    - 打包好的压缩包路径
    - 本地文件夹的绝对路径（自己改了代码想试效果时用这个）
 
