@@ -1,0 +1,64 @@
+{
+  "name": "dsh-floating-window",
+  "displayName": "DSH 状态悬浮窗",
+  "version": "0.9.15",
+  "private": false,
+  "type": "module",
+  "description": "浮在桌面上的磨砂玻璃状态窗：卡片态看任务明细、悬浮态用一根细柱表达状态，一眼看到 DSH 在干什么。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "floating-window",
+    "status",
+    "widget",
+    "glass",
+    "desktop"
+  ],
+  "license": "MIT",
+  "author": "Windpixy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Windpixy/dsh-floating-window.git"
+  },
+  "homepage": "https://github.com/Windpixy/dsh-floating-window#readme",
+  "bugs": {
+    "url": "https://github.com/Windpixy/dsh-floating-window/issues"
+  },
+  "icon": "./icon.svg",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./lib/*": "./lib/*",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "panel/Panel.ps1",
+    "panel/PanelVisual.ps1",
+    "panel/Settings.ps1",
+    "panel/settings.json",
+    "panel/run-panel.bat",
+    "scripts/*.ps1",
+    "locale/*.json",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

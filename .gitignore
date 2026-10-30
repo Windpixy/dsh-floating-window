@@ -1,0 +1,39 @@
+# 运行数据（插件写、卡片读），不进版本库
+*.log
+state.json
+state.json.tmp
+panel-pos.json
+heartbeat.json
+tokens.json
+settings.local.json
+
+# 节假日缓存：运行时从网络拉取后落盘，属于运行数据。
+# 内置数据在 lib/holidays-builtin.js 里，那份才进版本库。
+holidays.json
+holidays.json.tmp
+
+# 测试时临时产生的数据目录
+test/_*/
+
+# 测试跑出来的临时文件（截图、结果 json 等）。
+# 上一条 test/_*/ 只匹配**目录**，挡不住 test/_m4_state_idle.png 这种**文件** ——
+# 仓库里那 8 张测试截图加起来约 7MB，不该进版本库。
+test/_*
+
+# 人肉备份（配色前等等）。实测这类文件会跟着进 git。
+*.bak-*
+*.bak
+
+# 打包产物
+*.tgz
+docs/*.zip
+
+# 依赖
+node_modules/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

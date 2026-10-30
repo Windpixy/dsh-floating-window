@@ -1,0 +1,16 @@
+# dsh-floating-window bundle patch
+#
+# Inserts the plugin into the profile root as one entry. The row id addresses
+# this plugin's host half, which watches Harness session activity and writes
+# `state.json` for the floating glass window.
+#
+# 【2026-10-30 改名：dsh-desktop-card → dsh-floating-window】
+#   用户拍板的新名字。三个字段的分工：
+#     id   = 插件唯一标识，**改了之后 old 配置里指向它的行会失效**
+#     name = npm 包名，必须与 package.json 的 name 一致
+#   数据目录（%USERPROFILE%\.dsh\desktop-card\）**故意不改** ——
+#   改了会让已装用户的设置和日志全部"找不到"，而用户看不到这个路径，
+#   没有改的必要。
+- insert:
+    - id: dsh-floating-window
+      name: dsh-floating-window

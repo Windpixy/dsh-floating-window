@@ -1,0 +1,16 @@
+{
+  "openMode": "protocol",
+  "dshUrl": "",
+  "clickOpensDsh": true,
+  "alternateSeconds": 20,
+  "snapToEdge": true,
+  "edgeMargin": 8,
+  "cardWidth": 260,
+  "miniHeight": 96,
+  "glassOpacity": 80,
+  "approvalInline": false,
+  "approvalConfirm": true,
+  "barEnabled": true,
+  "barWidth": 14,
+  "barHeight": 120
+}

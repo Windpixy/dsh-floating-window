@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "桌面卡片",
+    "description": "把 DSH 的实时状态（运行中任务、待审批、今日 Token、刚完成）写进 state.json，供桌面磨砂玻璃卡片显示，并随 DSH 自动拉起卡片窗口。"
+  }
+}

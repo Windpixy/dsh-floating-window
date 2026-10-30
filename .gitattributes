@@ -1,0 +1,47 @@
+# 行尾与二进制约定
+#
+# 【为什么需要这个文件】
+#   如果没有它，git 会用每个 clone 者自己的 core.autocrlf 设置决定行尾，
+#   同一份仓库在不同机器上可能检出成 CRLF 或 LF，出现"我这能跑你那不能跑"的玄学问题。
+#   这里把规矩写死，谁 clone 都一样。
+#
+# 【两条互斥的硬约束，别改】
+#   .ps1 / .bat  → CRLF（Windows PowerShell 5.1 与 cmd.exe 的习惯）
+#   .json / .js  → LF  （JSON/ESM 不在乎，但统一成 LF 更干净，也避免 diff 噪音）
+#
+# 【BOM 不归这个文件管】
+#   .ps1 必须带 UTF-8 BOM（EF BB BF），package.json 必须不带 —— 这是字节层面的约定，
+#   git 会原样保留 BOM（已实测），所以这里不用（也不能）声明。
+#   改完 .ps1 记得跑 scripts/fix-bom.ps1，跑 scripts/check-package.ps1 复核。
+
+# ---- PowerShell / 批处理：CRLF ----
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# ---- 代码与配置：LF ----
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.svg   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# ---- 二进制：不要做任何转换 ----
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.zip   binary
+*.tgz   binary
+*.gz    binary
+
+# ---- 让 GitHub 语言统计把 .ps1 认成 PowerShell，别算进别的语言 ----
+*.ps1   linguist-language=PowerShell

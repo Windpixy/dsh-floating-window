@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Card",
+    "description": "Publishes live Harness status (running tasks, pending approvals, today's tokens, just-finished) to state.json for a floating frosted-glass desktop card, and launches that card window together with DSH."
+  }
+}
