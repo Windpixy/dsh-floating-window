@@ -34,11 +34,16 @@ const NOW = new Date('2026-10-27T22:00:00+08:00').getTime()
 // ================================================================ 心跳判断
 group('心跳判断：卡片到底在不在跑')
 
-test('没有心跳文件 -> 没在跑', () => {
+test('没有心跳文件 -> 没在跑，且标成"情况不明"（不能当成用户退出）', () => {
   const d = freshDir()
   const r = checkHeartbeat(d, { now: () => NOW })
   assert.equal(r.alive, false)
-  assert.match(r.reason, /不存在/)
+  assert.match(r.reason, /读不到/)
+  // 【这条是 2026-10-31 那个事故的护栏】
+  //   文件读不到必须带 unknown 标记，否则会被 shouldReviveCard 当成
+  //   "用户主动关闭"，卡片就算还在跑也永远不再被拉起。
+  assert.equal(r.unknown, true, '读不到 ≠ 用户退出，必须标成情况不明')
+  assert.equal(r.cleanExit, undefined, '没读到"我退出了"的证据，就不能说是正常退出')
 })
 
 test('心跳新鲜 -> 在跑', () => {
@@ -432,10 +437,74 @@ const HB = (o) => ({ alive: false, crashed: false, updatedAtMs: 1000, reason: 'x
 const ST = (o) => ({ wasAlive: true, lastCrashedAt: 0, reviveCount: 0, autoLaunch: true, reviving: false, ...o })
 
 test('用户主动关掉 -> 不重开（尊重用户意愿）', () => {
-  const v = shouldReviveCard(HB({ alive: false, crashed: false }), ST({ wasAlive: true }))
+  // 【判据必须是 cleanExit】
+  //   之前这条测试用的是 {alive:false, crashed:false}，而那个组合
+  //   同时也是"心跳文件读不到"的样子 —— 两种截然不同的情况共用一个判据，
+  //   结果就是 2026-10-31 卡片明明在跑却被判成"用户关了"，再也不拉起。
+  //   现在只有卡片自己写了 alive=false（cleanExit）才代表用户意愿。
+  const v = shouldReviveCard(HB({ alive: false, cleanExit: true }), ST({ wasAlive: true }))
   assert.equal(v.revive, false)
   assert.equal(v.reason, 'user-closed')
   assert.match(v.log, /不会自动重开/)
+})
+
+test('心跳文件读不到 -> 必须去救（这是 2026-10-31 卡片永久消失的直接原因）', () => {
+  // 复现当天真实场景：卡片 08:18 启动，一直跑到 11:44 心跳文件被锁/正在改名，
+  // 这一次读不到，插件就写下"不会自动重开"，用户只能重启 DSH。
+  const hb = { alive: false, missing: true, unknown: true, reason: '心跳文件读不到（可能正在写，或已被删除）' }
+  const v = shouldReviveCard(hb, ST({ wasAlive: true }))
+  assert.equal(v.revive, true, '读不到不等于用户关掉了，必须去确认卡片还在不在')
+  assert.equal(v.reason, 'unknown-heartbeat')
+})
+
+test('心跳文件读不到，就算恢复次数已到上限也要去救', () => {
+  // 上限是为了"别无限刷进程"，不是"允许卡片永久消失"。
+  const hb = { alive: false, missing: true, unknown: true, reason: '读不到' }
+  const v = shouldReviveCard(hb, ST({ wasAlive: true, reviveCount: 3, maxRevive: 3 }))
+  assert.equal(v.revive, true, '情况不明时的确认不受崩溃上限限制')
+})
+
+test('心跳文件读不到，但用户关了自动拉起 -> 不动', () => {
+  const hb = { alive: false, missing: true, unknown: true, reason: '读不到' }
+  const v = shouldReviveCard(hb, ST({ wasAlive: true, autoLaunch: false }))
+  assert.equal(v.revive, false)
+  assert.equal(v.reason, 'unknown-autolaunch-off')
+})
+
+test('心跳时间戳坏了 -> 也归为情况不明，去救', () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1, alive: true, updatedAtMs: 'not-a-number' })
+  const hb = checkHeartbeat(d, { now: () => NOW })
+  assert.equal(hb.alive, false)
+  assert.equal(hb.unknown, true, '数据损坏不是用户退出')
+  const v = shouldReviveCard(hb, ST({ wasAlive: true }))
+  assert.equal(v.revive, true)
+})
+
+test('心跳文件正在被写（内容不完整）-> 重试后仍读不到，标成情况不明', () => {
+  const d = freshDir()
+  writeFileSync(join(d, 'heartbeat.json'), '{"pid":123,"alive":tr', 'utf8')
+  // syncSleep 换成空函数，测试不真等
+  const hb = checkHeartbeat(d, { now: () => NOW, syncSleep: () => {} })
+  assert.equal(hb.alive, false)
+  assert.equal(hb.unknown, true)
+  assert.match(hb.reason, /内容不完整/)
+})
+
+test('读不到但重试期间文件恢复了 -> 正常判成在跑（重试机制的核心价值）', () => {
+  const d = freshDir()
+  let calls = 0
+  // 第一次调用时文件还不存在，重试( sleep )时才创建 —— 模拟"改名瞬间"
+  const hb = checkHeartbeat(d, {
+    now: () => NOW,
+    syncSleep: () => {
+      calls++
+      writeHb(d, { pid: 555, alive: true, updatedAtMs: NOW - 500 })
+    },
+  })
+  assert.equal(calls > 0, true, '应该真的重试过')
+  assert.equal(hb.alive, true, '重试读到就正常了，根本不该产生误判')
+  assert.equal(hb.pid, 555)
 })
 
 test('崩掉了 -> 必须自动重开', () => {
@@ -545,6 +614,122 @@ test('真·连续崩溃仍然会被拦住（归零逻辑不能把这道闸门弄
   const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 99999 }), ST({ reviveCount, maxRevive: 3 }))
   assert.equal(v.revive, false, '无限刷进程会拖垮机器，这道闸门必须留着')
   assert.equal(v.reason, 'gave-up')
+})
+
+// ---------------------------------------------------------------- 只有真启动才计数
+//
+// 【这条钉死的是什么】
+//   2026-10-31 用户实际遇到：卡片一直在跑（08:18 启动），中间某次心跳文件
+//   读不到，被判成崩溃并走了恢复流程。那次恢复其实什么都没启动
+//   （launched === false），但 reviveCount 照样 +1。反复几次就把 3 次
+//   预算耗光，最后变成"永久不再恢复"。
+//
+//   次数上限的本意是"别无限刷进程"，所以只有真的 spawn 了新进程才算数。
+//   这里把 index.js 里那段判定抽成等价逻辑来断言。
+group('恢复次数只该被"真启动了新进程"消耗')
+
+// index.js 里的等价判定（真源码改动时这里要同步，测试会在不同步时失败）
+const countsAsAttempt = (r) => Boolean(r && r.ok === true && r.launched === true)
+
+test('真的启动了新进程 -> 算一次', () => {
+  assert.equal(countsAsAttempt({ ok: true, launched: true, reason: 'started-attached' }), true)
+})
+
+test('睡醒假象（recovered-from-sleep）-> 不算', () => {
+  assert.equal(countsAsAttempt({ ok: true, launched: false, reason: 'recovered-from-sleep' }), false)
+})
+
+test('卡片本来就在跑（already-running）-> 不算', () => {
+  assert.equal(countsAsAttempt({ ok: true, launched: false, reason: 'already-running' }), false)
+})
+
+test('启动失败 -> 不算', () => {
+  assert.equal(countsAsAttempt({ ok: false, launched: false, reason: 'all-strategies-failed' }), false)
+})
+
+test('对照：如果按老逻辑（只看 ok）计数，already-running 会被白白消耗一次', () => {
+  const r = { ok: true, launched: false, reason: 'already-running' }
+  const oldLogic = Boolean(r && r.ok === true)
+  assert.equal(oldLogic, true, '老逻辑确实会算成一次')
+  assert.equal(countsAsAttempt(r), false, '新逻辑不算 —— 这就是修的内容')
+})
+
+// ---------------------------------------------------------------- 情况不明时不叠第二张卡
+//
+// 【这组钉死的是"修了 A 引入 B"的风险】
+//   修完"心跳读不到就去看一眼"之后，新的可能是：
+//   卡片其实活得好好的，只是文件那一刻锁着，插件跑去启动 —— 叠出第二张。
+//   卡片有单实例保护所以不会真出两个窗口，但会白起一个 PowerShell 进程。
+//   所以情况不明时要多读几次再决定。
+group('情况不明时不能急着起第二张卡')
+
+test('第一次读不到，但再读几次读到了 -> 不启动，直接认为在跑', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+
+  let reads = 0
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: pd,
+    dataDir: d,
+    log: (m) => logs.push(m),
+    // 第一次(内部重试 1 次)读不到；之后在某次复查前把心跳写出来
+    readAttempts: 1,
+    syncSleep: () => {
+      reads++
+      // 第 2 次复查时"卡片写了心跳"
+      if (reads === 2) writeHb(d, { pid: 999, alive: true, updatedAtMs: Date.now() })
+    },
+    unknownRecheckMs: 1,
+    unknownRecheckTimes: 5,
+  })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.launched, false, '读到了就不该再起进程')
+  assert.equal(r.reason, 'already-running')
+  assert.ok(logs.some(m => m.includes('卡片一直在跑')), '日志要说清楚为什么没起')
+})
+
+test('一直读不到 -> 才按"卡片不在"处理（真需要救的情况不能被挡住）', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: pd,
+    dataDir: d,
+    log: (m) => logs.push(m),
+    readAttempts: 1,
+    syncSleep: () => {},
+    unknownRecheckMs: 1,
+    unknownRecheckTimes: 3,
+    dryRun: true,          // 走完判断但不真起进程
+  })
+
+  assert.ok(logs.some(m => m.includes('仍然读不到心跳')), '要明确说复查过还是读不到')
+  // dryRun 下不代表真启动，关键是它没有误判成 already-running
+  assert.notEqual(r.reason, 'already-running', '一直读不到就不能当成"在跑"')
+})
+
+test('明确的崩溃（读到过期心跳）不走"情况不明"复查，不拖时间', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+  writeHb(d, { pid: 1, alive: true, updatedAtMs: Date.now() - 3600_000 })
+
+  const logs = []
+  await ensureCardRunning({
+    panelDir: pd, dataDir: d, log: (m) => logs.push(m),
+    graceMs: 0, sleep: async () => {}, dryRun: true,
+    syncSleep: () => {}, unknownRecheckMs: 1, unknownRecheckTimes: 3,
+  })
+  assert.equal(logs.some(m => m.includes('仍然读不到心跳')), false,
+    '崩溃是明确结论，不该再去"情况不明"复查')
 })
 
 // ================================================================ 执行

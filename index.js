@@ -694,13 +694,32 @@ export function apply(ctx, config) {
 
               // 【v0.10.1：睡眠唤醒的假象不能消耗恢复次数】
               //   电脑睡一觉醒来，心跳看起来"过期几小时"，ensureCardRunning
-              //   现在会先等 2.6 秒复查；如果卡片自己接着写心跳了，它会返回
+              //   会先等 2.6 秒复查；如果卡片自己接着写心跳了，它会返回
               //   reason='recovered-from-sleep'，并没有真的重开任何东西。
-              //   这种情况属于"什么都没发生"，必须把次数和去重标记都退回去，
-              //   否则睡几次觉醒就把预算耗光 —— 而卡片其实一次都没崩过。
+              //   这种情况属于"什么都没发生"，必须把次数和去重标记都退回去。
               if (r && r.reason === 'recovered-from-sleep') {
                 lastCrashedAt = 0
                 reviveCount = Math.max(0, reviveCount - 1)
+                return
+              }
+
+              // 【v0.10.2：只有"真的启动了新进程"才消耗恢复次数】
+              //
+              // 【为什么不能只看 r.ok】
+              //   2026-10-31 用户实际踩到的问题：卡片一直在跑（08:18 启动），
+              //   中间某一次心跳文件恰好读不到，被判成"卡片崩溃"并走了恢复流程。
+              //   这次恢复其实什么都没启动（r.launched === false 或
+              //   reason === 'already-running'），但次数照样 +1 了。
+              //   反复几次就把 3 次预算耗光，最后变成"永久不再恢复"。
+              //
+              //   次数这个上限的本意是"别无限刷进程拖垮机器"，
+              //   所以只有真的 spawn 了新进程才算数。没启动任何东西的尝试
+              //   一律退次数、退去重标记，让下一轮还能正常判断。
+              const reallyLaunched = r && r.ok === true && r.launched === true
+              if (!reallyLaunched) {
+                lastCrashedAt = 0
+                reviveCount = Math.max(0, reviveCount - 1)
+                log('这次恢复并没有真的启动新进程（卡片可能一直在跑），不消耗恢复次数')
                 return
               }
 
@@ -709,7 +728,6 @@ export function apply(ctx, config) {
               //   但恢复失败时，心跳还是那一条（卡片没活过来，时间戳不会变），
               //   如果保留去重标记，下一轮就会认为"已经处理过"而永远不再尝试，
               //   卡片就真的永远回不来了 —— 这跟没修一样。
-              //   所以失败时把标记退回原值，让下一轮（5 秒后）重新尝试。
               if (!r.ok) {
                 lastCrashedAt = 0
                 reviveCount = Math.max(0, reviveCount - 1)   // 失败的尝试不该消耗次数
