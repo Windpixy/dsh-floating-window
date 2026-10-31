@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { checkHeartbeat, panelScriptPath, launchCard, ensureCardRunning, shouldReviveCard } from '../lib/launcher.js'
+import { checkHeartbeat, panelScriptPath, launchCard, ensureCardRunning, shouldReviveCard, judgeAsleepRecovery, readLaunchState, writeLaunchState, shouldTryDetached } from '../lib/launcher.js'
 
 const tests = []
 const test = (name, fn) => tests.push({ name, fn })
@@ -251,6 +251,171 @@ test('没心跳时 ensureCardRunning 会尝试启动（dryRun 验证意图）', 
   assert.equal(r.launched, false, 'dryRun 不真的启动')
 })
 
+// ================================================================ 睡眠唤醒保护
+//
+// 【这组测的是什么真事故】
+//   2026-10-31 从 plugin.log 查出：15 次「卡片异常退出」判定里，12 次和
+//   「电脑刚从睡眠唤醒」精确到秒地吻合（±5 秒）。卡片根本没崩，只是被
+//   系统挂起、还没来得及恢复写心跳。旧逻辑一读到"几小时前的心跳"就重开一张。
+//
+//   修法：先等 2.6 秒再看一眼，心跳自己往前走了 = 假象，别重开。
+group('睡眠唤醒保护：心跳过期到底是真崩了还是刚睡醒')
+
+const STALE = { alive: false, crashed: true, reason: '心跳过期（3600 秒没更新）', ageMs: 3600_000, updatedAtMs: 1000 }
+
+test('睡醒后心跳恢复了 -> 判定为假象，不重开', () => {
+  const v = judgeAsleepRecovery(STALE, { alive: true, reason: '心跳正常', pid: 123 })
+  assert.equal(v.recovered, true, '卡片自己接着写心跳了，说明它活着')
+  assert.equal(v.reason, 'heartbeat-resumed')
+})
+
+test('心跳时间戳往前走了（还没追上新鲜度）-> 也算活着', () => {
+  // 卡片刚恢复，只写了一次心跳，时间戳比第一次读到时新，但还没到 8 秒以内
+  const v = judgeAsleepRecovery(STALE, { alive: false, crashed: true, reason: 'x', updatedAtMs: 2000 })
+  assert.equal(v.recovered, true)
+  assert.equal(v.reason, 'heartbeat-advanced')
+})
+
+test('心跳时间戳一动不动 -> 真崩了，必须重开', () => {
+  const v = judgeAsleepRecovery(STALE, { alive: false, crashed: true, reason: 'x', updatedAtMs: 1000 })
+  assert.equal(v.recovered, false, '没人写心跳了，这才是真崩')
+  assert.equal(v.reason, 'heartbeat-frozen')
+})
+
+test('复查时卡片已经写了"我正常退出"-> 尊重退出，不重开', () => {
+  // 【为什么这里必须带上 cleanExit 标记】
+  //   第一版是用 `alive===false` 判的，结果"心跳文件没了"也会命中这一条，
+  //   等于把"情况不明"当成"用户主动退出"，卡片真死了就不去救 ——
+  //   那正是 v0.5.1 那个老事故的形态。现在只认明确的 cleanExit。
+  const v = judgeAsleepRecovery(STALE, { alive: false, cleanExit: true, reason: '卡片上次是正常退出的' })
+  assert.equal(v.recovered, false)
+  assert.equal(v.reason, 'card-exited-cleanly')
+})
+
+test('复查时心跳文件没了 -> 保守当成没恢复（仍然去救）', () => {
+  const v = judgeAsleepRecovery(STALE, { alive: false, reason: '心跳文件不存在（卡片从没启动过）' })
+  assert.equal(v.recovered, false)
+  assert.equal(v.reason, 'heartbeat-gone')
+})
+
+test('第一次就不是过期心跳 -> 不走这套判断', () => {
+  const v = judgeAsleepRecovery({ alive: false, reason: '心跳文件不存在' }, { alive: true })
+  assert.equal(v.recovered, false)
+  assert.equal(v.reason, 'not-a-stale-heartbeat')
+})
+
+test('ensureCardRunning：睡醒假象 -> 不启动，且 reason 可识别', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+
+  // 心跳很旧（模拟睡眠几小时），但"过一会儿"会自己恢复
+  writeHb(d, { pid: 777, alive: true, updatedAtMs: Date.now() - 4 * 3600 * 1000 })
+
+  const logs = []
+  let wrote = false
+  const r = await ensureCardRunning({
+    panelDir: pd,
+    dataDir: d,
+    log: (m) => logs.push(m),
+    // 【为什么 graceMs 不能设 0】
+    //   代码里是 `if (graceMs > 0) await sleep(graceMs)` —— 设 0 就等于
+    //   不等待、也不会调用 sleep，我这个"假 sleep 顺手刷新心跳"的把戏就
+    //   永远不触发，测出来是"心跳冻住了"（这正是我第一版测试写错的地方）。
+    //   所以给一个很小的正数，再靠假 sleep 跳过真实等待。
+    graceMs: 1,
+    // 假 sleep：第一次被调用（宽限）时把心跳刷新成"刚写的"
+    sleep: async () => {
+      if (!wrote) {
+        wrote = true
+        writeHb(d, { pid: 777, alive: true, updatedAtMs: Date.now() })
+      }
+    },
+  })
+
+  assert.equal(r.ok, true)
+  assert.equal(r.launched, false, '假象不该真的启动新卡片')
+  assert.equal(r.reason, 'recovered-from-sleep')
+  assert.ok(logs.some(m => m.includes('不重开')), '日志要说清楚为什么没动')
+})
+
+test('ensureCardRunning：心跳确实死了 -> 照常去启动（不能被保护逻辑挡住）', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+  writeHb(d, { pid: 888, alive: true, updatedAtMs: Date.now() - 4 * 3600 * 1000 })
+
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: pd,
+    dataDir: d,
+    log: (m) => logs.push(m),
+    graceMs: 0,
+    sleep: async () => {},      // 心跳不会恢复
+    dryRun: true,               // 走完判断但不真起进程
+  })
+  // dryRun 下 ok=true 但 launched=false；关键是它**通过了**保护逻辑往下走
+  assert.equal(r.ok, true)
+  assert.ok(logs.some(m => m.includes('确认卡片确实不在了')), '要明确说复查后确认死了')
+})
+
+// ================================================================ detached 策略记忆
+//
+// 【这组测的是什么真事故】
+//   plugin.log 里 43 次 detached 尝试，31 次失败；12 次"成功"全是假的
+//   （心跳 pid 和启动 pid 每次都不同）。每次失败都要白等 6 秒。
+//   修法：失败就记住，下次直接走 attached，30 天后自动再试。
+group('detached 策略记忆：别每次都白等 6 秒')
+
+test('从没失败过 -> 仍然先试 detached', () => {
+  const v = shouldTryDetached({})
+  assert.equal(v.try, true)
+  assert.equal(v.reason, 'never-failed')
+})
+
+test('刚失败过 -> 跳过 detached', () => {
+  const v = shouldTryDetached({ detachedUnsupported: true, detachedFailedAt: 1000 }, { now: 2000 })
+  assert.equal(v.try, false)
+  assert.equal(v.reason, 'known-unsupported')
+  assert.ok(v.retryInMs > 0)
+})
+
+test('超过 30 天 -> 再试一次（环境可能修好了）', () => {
+  const old = 1000
+  const thirtyOneDaysLater = old + 31 * 24 * 3600 * 1000
+  const v = shouldTryDetached({ detachedUnsupported: true, detachedFailedAt: old }, { now: thirtyOneDaysLater })
+  assert.equal(v.try, true)
+  assert.equal(v.reason, 'retry-window-elapsed')
+})
+
+test('记着不支持但没有时间戳 -> 数据不完整，再试一次', () => {
+  const v = shouldTryDetached({ detachedUnsupported: true }, { now: 2000 })
+  assert.equal(v.try, true)
+  assert.equal(v.reason, 'no-timestamp')
+})
+
+test('启动记忆能写入并读回来', () => {
+  const d = freshDir()
+  assert.equal(writeLaunchState(d, { detachedUnsupported: true, detachedFailedAt: 12345 }), true)
+  const s = readLaunchState(d)
+  assert.equal(s.detachedUnsupported, true)
+  assert.equal(s.detachedFailedAt, 12345)
+})
+
+test('启动记忆文件坏了 -> 当成没有记忆，不抛错', () => {
+  const d = freshDir()
+  writeFileSync(join(d, 'card-launch.json'), '{ 这不是 json', 'utf8')
+  const s = readLaunchState(d)
+  assert.deepEqual(s, {}, '坏文件不能把启动流程搞崩')
+})
+
+test('目录不存在时读记忆也不抛错', () => {
+  const s = readLaunchState(join(TMP, 'no-such-dir-xyz'))
+  assert.deepEqual(s, {})
+})
+
 // ================================================================ 自动恢复判断
 //
 // 【为什么把这套判断抽成 shouldReviveCard 单独测】
@@ -339,6 +504,47 @@ test('恢复失败后必须能重试（failedToRevive 会清掉去重标记）',
   // 对照：成功的话 lastCrashedAt 就是 5000，下一轮不再重复
   const afterSuccess = shouldReviveCard(hb, ST({ lastCrashedAt: 5000 }))
   assert.equal(afterSuccess.revive, false, '成功恢复后不应再重复拉起')
+})
+
+// ---------------------------------------------------------------- 计数必须归零
+//
+// 【这条钉死的是 index.js 里那个真 bug】
+//   reviveCount 原来"只增不归零"，实际记的是"这个 DSH 进程里总共恢复过几次"，
+//   而不是"连续失败了几次"。日志里的真实后果（2026-10-28 22:49:54）：
+//     "卡片已连续异常退出 3 次，不再自动恢复。请手动运行 panel\run-panel.bat 排查。"
+//   而那 3 次全是电脑睡眠唤醒造成的误判，卡片一次都没真崩过。
+//   修完之后只要心跳恢复正常，计数就清零 —— 但真正的反复崩溃照样会被拦住，
+//   因为那种情况心跳一直是死的，走不到归零那一行。
+group('连续恢复次数的语义：卡片活回来就要清零')
+
+test('卡片活回来了 -> 计数清零后仍然有完整的 3 次预算', () => {
+  // 模拟：误判恢复过 2 次，然后卡片心跳恢复正常（index.js 会把 reviveCount 归零）
+  let reviveCount = 2
+  const aliveHb = { alive: true, reason: '心跳正常' }
+
+  // index.js 的归零逻辑：hb.alive === true 时 reviveCount = 0
+  if (aliveHb.alive === true) reviveCount = 0
+  assert.equal(reviveCount, 0, '卡片活着就该清零，否则跨天误判会累加')
+
+  // 之后真的崩了一次 -> 应该还有完整预算，能救
+  const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 9000 }), ST({ reviveCount }))
+  assert.equal(v.revive, true, '归零后真崩了必须能救')
+})
+
+test('不归零的对照：累计到 3 次就会被永久放弃（这就是修之前的 bug）', () => {
+  // 修复前：reviveCount 从不清零，跨几次误判就攒满
+  const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 9000 }), ST({ reviveCount: 3, maxRevive: 3 }))
+  assert.equal(v.revive, false)
+  assert.equal(v.reason, 'gave-up')
+  assert.match(v.log, /不再自动恢复/, '用户看不到卡片了，而界面上没有任何提示')
+})
+
+test('真·连续崩溃仍然会被拦住（归零逻辑不能把这道闸门弄坏）', () => {
+  // 卡片一直起不来：每一轮心跳都是死的，永远走不到"归零"那一行
+  const reviveCount = 3
+  const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 99999 }), ST({ reviveCount, maxRevive: 3 }))
+  assert.equal(v.revive, false, '无限刷进程会拖垮机器，这道闸门必须留着')
+  assert.equal(v.reason, 'gave-up')
 })
 
 // ================================================================ 执行

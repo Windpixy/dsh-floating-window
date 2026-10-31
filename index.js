@@ -691,6 +691,19 @@ export function apply(ctx, config) {
           ensureCardRunning({ panelDir: cardDir, dataDir: dir, log, staleMs: cfg.heartbeatStaleMs })
             .then((r) => {
               log('自动恢复结果: ' + JSON.stringify({ ok: r.ok, launched: r.launched, reason: r.reason }))
+
+              // 【v0.10.1：睡眠唤醒的假象不能消耗恢复次数】
+              //   电脑睡一觉醒来，心跳看起来"过期几小时"，ensureCardRunning
+              //   现在会先等 2.6 秒复查；如果卡片自己接着写心跳了，它会返回
+              //   reason='recovered-from-sleep'，并没有真的重开任何东西。
+              //   这种情况属于"什么都没发生"，必须把次数和去重标记都退回去，
+              //   否则睡几次觉醒就把预算耗光 —— 而卡片其实一次都没崩过。
+              if (r && r.reason === 'recovered-from-sleep') {
+                lastCrashedAt = 0
+                reviveCount = Math.max(0, reviveCount - 1)
+                return
+              }
+
               // 【恢复失败要把去重标记退回去，否则再也不会重试】
               //   去重靠 lastCrashedAt 记"这个崩溃我处理过了"。
               //   但恢复失败时，心跳还是那一条（卡片没活过来，时间戳不会变），
@@ -708,6 +721,25 @@ export function apply(ctx, config) {
               reviveCount = Math.max(0, reviveCount - 1)
             })
             .finally(() => { reviving = false })
+        }
+
+        // 【v0.10.1：卡片活回来了，把"连续恢复次数"清零 —— 这是"连续"二字的本意】
+        //
+        // 【原来的 bug】
+        //   reviveCount 只在上面的失败分支里减，**成功之后从不归零**。
+        //   于是它实际记的是"这个 DSH 进程里总共恢复过几次"，而不是
+        //   "连续恢复失败了几次"。日志里的真实后果（2026-10-28 22:49:54）：
+        //     卡片已连续异常退出 3 次，不再自动恢复。
+        //     请手动运行 panel\run-panel.bat 排查。
+        //   —— 那 3 次全是电脑睡眠唤醒造成的误判，卡片一次都没真崩过，
+        //      但预算被累计用光，从此**卡片再也不自动回来，界面上没有任何提示**。
+        //
+        //   修完之后：只要卡片确认活着（心跳正常），计数就归零。
+        //   真正的反复崩溃照样会被 3 次上限拦住（因为那种情况心跳一直是死的，
+        //   走不到这一行），但"跨天的偶发误判"不会再加起来算。
+        if (hb.alive === true && reviveCount !== 0) {
+          reviveCount = 0
+          log('卡片已恢复正常，连续恢复次数清零')
         }
 
         wasAlive = hb.alive
