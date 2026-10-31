@@ -512,7 +512,13 @@ test('崩掉了 -> 必须自动重开', () => {
   assert.equal(v.revive, true, '崩溃后不重开，用户就永远看不到卡片了')
   assert.equal(v.reason, 'crashed')
   assert.equal(v.stamp, 5000)
-  assert.match(v.log, /异常退出/)
+  // 【v0.10.3 改断言】原来要求日志里有"异常退出"这个词。
+  //   但这句话是在**复查之前**打的，而复查常常发现"其实是电脑刚睡醒"，
+  //   于是日志里留下一堆假的崩溃记录（2026-10-31 13:30 / 13:37 真实发生）。
+  //   现在这里只如实说"心跳过期、先复查"，"异常退出"留给复查确认后再写。
+  assert.match(v.log, /心跳过期/)
+  assert.match(v.log, /复查/)
+  assert.doesNotMatch(v.log, /异常退出/, '复查之前不许下"异常退出"的结论')
 })
 
 test('同一个崩溃只处理一次（5 秒一轮，不能每轮都启一次）', () => {
@@ -605,7 +611,12 @@ test('不归零的对照：累计到 3 次就会被永久放弃（这就是修�
   const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 9000 }), ST({ reviveCount: 3, maxRevive: 3 }))
   assert.equal(v.revive, false)
   assert.equal(v.reason, 'gave-up')
-  assert.match(v.log, /不再自动恢复/, '用户看不到卡片了，而界面上没有任何提示')
+  // 【v0.10.3 改断言】原来断言日志里有"不再自动恢复"。
+  //   措辞改成了"暂停自动恢复"，因为"不再"太绝对（30 天后/重启后会重来），
+  //   而且原来那句"已连续异常退出 N 次"是在没复查的情况下下的结论，
+  //   历史上让人误以为卡片天天在崩，实际多是睡眠唤醒的假象。
+  assert.match(v.log, /暂停自动恢复/, '用户看不到卡片了，而界面上没有任何提示')
+  assert.match(v.log, /run-panel\.bat/, '得告诉用户手动怎么救')
 })
 
 test('真·连续崩溃仍然会被拦住（归零逻辑不能把这道闸门弄坏）', () => {
@@ -730,6 +741,45 @@ test('明确的崩溃（读到过期心跳）不走"情况不明"复查，不拖
   })
   assert.equal(logs.some(m => m.includes('仍然读不到心跳')), false,
     '崩溃是明确结论，不该再去"情况不明"复查')
+})
+
+// ---------------------------------------------------------------- 别在复查前下结论
+//
+// 【这组钉死的是 2026-10-31 13:30/13:37 真实发生在日志里的误导】
+//   原文：
+//     [ERR] 卡片异常退出（不是正常关闭）：心跳过期（338 秒没更新，未正常退出）
+//     [INFO] 复查后心跳已恢复：卡片其实活着，是刚才没醒透，不重开
+//   卡片根本没异常退出（它跟着电脑睡了）。但 ERR 那句已经落盘，
+//   任何人翻日志都会以为卡片天天在崩 —— 排查时我自己就被带偏过一次。
+//
+//   修法：复查之前只如实说"心跳过期、去复查"，不写"异常退出"。
+group('复查之前不许下"异常退出"的结论')
+
+test('心跳过期（crashed）-> 日志只描述现状 + 说明要复查，不下结论', () => {
+  const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 5000 }), ST({}))
+  assert.equal(v.revive, true)
+  assert.match(v.log, /心跳过期/)
+  assert.match(v.log, /复查/)
+  assert.doesNotMatch(v.log, /异常退出/, '这一刻还没复查，不能说它异常退出')
+  assert.doesNotMatch(v.log, /崩/, '同理，也不能说崩了')
+})
+
+test('情况不明（missing）-> 日志同样只描述现状', () => {
+  const v = shouldReviveCard(
+    { alive: false, missing: true, unknown: true, reason: '心跳文件读不到（可能正在写）' },
+    ST({}),
+  )
+  assert.equal(v.revive, true)
+  assert.match(v.log, /情况不明/)
+  assert.doesNotMatch(v.log, /异常退出/)
+})
+
+test('给不出"异常退出"级结论时，用户仍能从日志看出该怎么办（不丢信息）', () => {
+  // 否定式的要求容易写成"什么都不说"，这里钉住"关键信息不能丢"：
+  // 必须能看出 ①卡片可能不在 ②正在去查
+  const v = shouldReviveCard(HB({ crashed: true, updatedAtMs: 5000 }), ST({}))
+  assert.match(v.log, /心跳/, '得说明是心跳出的问题')
+  assert.match(v.log, /复查/, '得说明接下来要去查')
 })
 
 // ================================================================ 执行
