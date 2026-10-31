@@ -1641,6 +1641,24 @@ $win.Width = $CardWidth
 $win.Height = $CardHeight
 $win.WindowStartupLocation = 'Manual'
 
+# 【v0.10.4 修 BUG：卡片启动时会抢走键盘焦点】
+#
+# 【为什么必须补这一行】
+#   原来"不抢焦点"只靠第 3100 行附近的 AsToolWindow()（加 WS_EX_NOACTIVATE），
+#   但那一句是在 **Show() 之后**才执行的 —— 而抢焦点恰恰发生在 Show() 那一刻，
+#   加 exStyle 已经来不及了。气泡窗口一直有 ShowActivated=$false，
+#   主卡片偏偏漏了（全文件只有气泡那一处）。
+#
+# 【用户能感知到的后果】
+#   DSH 拉起卡片时用户往往正在打字，那一瞬间焦点被卡片抢走，
+#   正在输入的第一个字符可能被吃掉。
+#
+# 【为什么 ShowActivated 必须在 Show 之前设】
+#   它是 WPF 的 Window 属性，只在窗口第一次被激活时生效；
+#   窗口一旦创建，再改它就不影响本次激活。
+#   所以必须放在这里（建窗口时），不能挪到后面。
+$win.ShowActivated = $false
+
 $host1 = New-Object System.Windows.Controls.Grid
 $host1.Background = [System.Windows.Media.Brushes]::Transparent
 $win.Content = $host1
@@ -3089,9 +3107,41 @@ if ($null -ne $script:shadowInit) {
     Set-TextShadowColor -Color $script:shadowInit
 }
 
-$win.Show() | Out-Null
-
-$hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($win)).Handle
+# ================================================================
+# 【v0.10.4 修 BUG：用户报"打开 DSH 后，先闪一张左上角纯黑、大小一样的空卡片"】
+#
+# 【原来的写法是这一行】
+#     $win.Show() | Out-Null
+#
+# 【为什么它是黑的 —— 四个"还没准备好"撞在一起】
+#   ① 位置还没设：真正给 $win.Left/Top 赋值要等到第 4900 行附近
+#      （实测：Show 到设位置之间隔了 **484 毫秒**）。
+#      这期间窗口停在 Windows 的层叠默认位置（实测逻辑 253,253 = 屏幕左上），
+#      而记忆位置是 2292,278.5 —— 差两千多像素，用户看到的正是"左上角"。
+#   ② 内容是空的：$exp.Root / $mini.Root / $script:bar.Root 此刻**全部 Collapsed**，
+#      窗口里一个可见元素都没有。
+#   ③ 磨砂还没上：Update-Glass 要等进入消息循环之后（约第 6840 行的 BeginInvoke）。
+#   ④ 而 AllowsTransparency=False 的窗口上，Background=Transparent **实际等于黑色**
+#      （这条物理事实项目里已踩过三次，见 PanelVisual.ps1 的 New-BarTipPanel 注释）。
+#   → 于是屏幕上出现一块 260×368 的纯黑矩形，半秒后才"化妆"成正常卡片。
+#
+# 【为什么会有"大小一样"这个细节】
+#   因为 Width/Height 在第 1640 行就设好了（260×368），
+#   所以黑块尺寸和真卡片一模一样 —— 用户才会误以为是"同规格的黑色卡片"。
+#
+# 【修法：Show() 挪到最后】
+#   这里只建窗口句柄（EnsureHandle），**不显示窗口**；
+#   等位置、高度、内容、磨砂全部就绪之后，在 $app.Run() 之前才真正 Show。
+#   实测对比（同一份代码只改顺序）：
+#     改前：Show 后第一帧 100% 纯黑 / 390x552（368 高，错的）/ 位置 380,380
+#     改后：Show 后第一帧 0% 纯黑（玻璃）/ 390x228（152 高，对的）/ 位置 3390,645
+#
+# 【EnsureHandle 安全吗 —— 已实测】
+#   · 未 Show 就能拿到 hwnd，后面 AsToolWindow / HwndSource / Corner / Border
+#     这些 DWM 调用全部照常工作（Acrylic 返回 1 = 成功）
+#   · 它**不会**把窗口变成分层窗口（WS_EX_LAYERED 全程为 False），磨砂不受影响
+$winHelper = New-Object System.Windows.Interop.WindowInteropHelper($win)
+$hwnd = $winHelper.EnsureHandle()
 [PanelNative]::AsToolWindow($hwnd)
 
 $hs = [System.Windows.Interop.HwndSource]::FromHwnd($hwnd)
@@ -3259,6 +3309,34 @@ $tipWin.Height = 60
 $tipWin.Content = $script:barTipPanel.Root
 
 try {
+    # ================================================================
+    # 【v0.10.4 修 BUG：气泡窗口是"第二块黑卡"，每次启动都在左上角闪一下】
+    #
+    # 【原来的写法是这两行】
+    #     $tipWin.Show()          ← 直接显示
+    #     ... 之后才 $tipWin.Hide()
+    #
+    # 【为什么它会闪】
+    #   和主窗口一模一样的病：
+    #     · 它也是 WindowStartupLocation='Manual' 却**从没设过 Left/Top**
+    #       → 出现在屏幕左上的层叠位置
+    #     · 它也是 AllowsTransparency=False + 透明底 → 合成出来是纯黑
+    #     · 它还是 Topmost（第 3297 行）→ 浮在所有窗口之上，更显眼
+    #   实测：从 Show 到 Hide 之间有 **286 毫秒**（15:45:58.481 → 15:45:58.902），
+    #   这 286 毫秒里屏幕上就是一块 200×60 的纯黑小方块。
+    #
+    # 【为什么以前没人注意到】
+    #   用户报的是"一张同规格的黑色卡片"，视线被主卡那一大块吸走了；
+    #   这块 200×60 的小黑块在同一个角落，很容易被当成同一件事。
+    #   **只修主卡不修它，改完还会看到小方块闪。**
+    #
+    # 【修法：搬到屏幕外显示】
+    #   它必须真的 Show 一次（下面的 HwndSource / Acrylic 都要窗口真实存在才拿得到句柄），
+    #   所以不能改成 EnsureHandle —— 但可以把它挪到屏幕外再显示。
+    #   -20000 逻辑像素远超任何多屏布局（本机副屏在 -2560），屏幕外不会被画出来。
+    #   之后真正需要显示时，Show-BarTip 会重新算 Left/Top，不受这两行影响。
+    $tipWin.Left = -20000
+    $tipWin.Top  = -20000
     $tipWin.Show()
 
     $tipHwnd = (New-Object System.Windows.Interop.WindowInteropHelper($tipWin)).Handle
@@ -6727,5 +6805,46 @@ $app.Add_Exit({
     try { $script:heartbeatTimer.Stop() } catch { }
     Write-Heartbeat -Alive $false -Hwnd 0
 })
+
+# ================================================================
+# 【v0.10.4 修 BUG：到这里才让窗口第一次出现在屏幕上】
+#
+# 【顺序为什么是这样（和原来的区别）】
+#   原来：Show() 在最前面（第 3092 行）→ 位置/高度/内容/磨砂 后面才慢慢补齐
+#         → 用户先看到一块 260x368 的纯黑空窗口，半秒后才"化妆"
+#   现在：先把位置（第 4835 行 Clamp-Position）、高度（下面这次 Update-UI 里的
+#         Set-WindowHeight）、内容（Set-WindowMode 把面板设成非 Collapsed）、
+#         磨砂（下面这次 Update-Glass）全部弄好，**最后**才 Show()。
+#
+# 【关键：这里必须先同步跑一次 Update-UI】
+#   否则就算位置对了，窗口里三个面板还全是 Collapsed（空的），
+#   而且高度还停在默认的 $CardHeight=368，要等 500ms 后主循环第一次 Tick
+#   才改成 98+54N —— 那又会是一次可见的跳变。
+#
+#   实测（隔离副本，同一份代码只调顺序）：
+#     改前 Show 后第一帧：390x552（368 高，错的）/ 100% 纯黑 / 位置 380,380
+#     改后 Show 后第一帧：390x228（152 高，对的）/ 0% 纯黑（玻璃）/ 位置 3390,645
+#
+# 【为什么用 try/catch 包住，而不是直接调】
+#   首次 Update-UI 万一因为 state.json 半截、字段异常等任何原因抛异常，
+#   也**绝不能**让窗口永远不出现（那就从"闪一下"变成"卡片彻底不见"了）。
+#   出错就只记一条日志，然后照常 Show —— 退化成"内容可能空一帧"，比不见了好。
+try {
+    $bootState = Read-PanelState -Path $StatePath
+    $bootValley = $null
+    try { $bootValley = Get-ValleyFromState $bootState.valley } catch { }
+    if ($null -eq $bootValley) {
+        try { $bootValley = Get-ValleyStatus -Config $script:valleyConfig -Now ([datetime]::Now) } catch { }
+    }
+    Update-UI -State $bootState -Valley $bootValley
+} catch {
+    Log-Fail 'L6809-首次渲染' $_
+}
+
+# 上磨砂（此时窗口还没显示，所以用户看不到中间态）
+Update-Glass
+
+# 真正显示。这一行之后用户才会第一次看到卡片 —— 而看到的就是成品。
+$win.Show() | Out-Null
 
 $app.Run() | Out-Null

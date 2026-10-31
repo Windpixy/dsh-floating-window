@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { checkHeartbeat, panelScriptPath, launchCard, ensureCardRunning, shouldReviveCard, judgeAsleepRecovery, readLaunchState, writeLaunchState, shouldTryDetached } from '../lib/launcher.js'
+import { checkHeartbeat, panelScriptPath, launchCard, ensureCardRunning, shouldReviveCard, judgeAsleepRecovery, readLaunchState, writeLaunchState, shouldTryDetached, isProcessAlive, verifyHeartbeatPid } from '../lib/launcher.js'
 
 const tests = []
 const test = (name, fn) => tests.push({ name, fn })
@@ -782,7 +782,160 @@ test('给不出"异常退出"级结论时，用户仍能从日志看出该怎么
   assert.match(v.log, /复查/, '得说明接下来要去查')
 })
 
-// ================================================================ 执行
+// ================================================================ 心跳还新鲜，但进程已经没了
+//
+// 【这一组守的是什么真 bug —— 2026-10-31 用户实际踩到的】
+//   卡片是 attached 启动的（挂在 DSH 进程树里），DSH 一关它就跟着死。
+//   DSH 重新打开只要 10~15 秒，而"心跳过期"门槛是 8 秒 ——
+//   于是**只要重启够快，新插件读到的心跳就还没过期**，于是：
+//     "卡片已在运行" → 跳过拉起 → 屏幕上一张卡都没有，而且不会自愈。
+//
+//   真实日志（plugin.log 14:04:56.959）：
+//     「卡片已在运行（pid=39096，心跳 6 秒前）」
+//   而 pid 39096 的最后一个心跳是 14:04:51.370 —— 判活那一刻它已经死了 5.6 秒。
+//   同形态在日志里至少出现 5 次（00:03:29 / 11:42:14 / 15:14:35 / 00:30:15）。
+group('心跳判断：心跳新鲜但那个 pid 已经不在了')
+
+test('verifyHeartbeatPid：pid 确实没了 -> gone=true', () => {
+  const r = verifyHeartbeatPid({ alive: true, pid: 4321 }, { isPidAlive: () => false })
+  assert.equal(r.gone, true)
+  assert.equal(r.known, true)
+  assert.equal(r.pid, 4321)
+})
+
+test('verifyHeartbeatPid：pid 还活着 -> gone=false', () => {
+  const r = verifyHeartbeatPid({ alive: true, pid: 4321 }, { isPidAlive: () => true })
+  assert.equal(r.gone, false)
+  assert.equal(r.known, true)
+})
+
+test('verifyHeartbeatPid：判断不了（权限/异常）-> 不推翻心跳结论', () => {
+  // 【这条是安全护栏】EPERM 之类的情况必须当成"活着"。
+  // 否则跨用户/提权环境下会把一张正常卡片误判成死了，然后叠出第二张。
+  const r = verifyHeartbeatPid({ alive: true, pid: 4321 }, { isPidAlive: () => null })
+  assert.equal(r.gone, false, '查不到 ≠ 死了')
+  assert.equal(r.known, false)
+
+  const r2 = verifyHeartbeatPid({ alive: true, pid: 4321 }, { isPidAlive: () => { throw new Error('boom') } })
+  assert.equal(r2.gone, false, '探测抛异常也不能判死')
+})
+
+test('verifyHeartbeatPid：心跳里没 pid（极老版本卡片）-> 不推翻', () => {
+  const r = verifyHeartbeatPid({ alive: true }, { isPidAlive: () => false })
+  assert.equal(r.gone, false)
+  assert.equal(r.known, false)
+})
+
+test('isProcessAlive：自己这个进程一定活着', () => {
+  assert.equal(isProcessAlive(process.pid), true)
+})
+
+test('isProcessAlive：明显不存在的 pid -> false', () => {
+  // 用一个肯定不会存在的 pid（Windows pid 是 4 的倍数，这里用超大值）
+  assert.equal(isProcessAlive(0x7FFFFFF0), false)
+})
+
+test('isProcessAlive：非法输入 -> null（判断不了，不判死）', () => {
+  assert.equal(isProcessAlive(NaN), null)
+  assert.equal(isProcessAlive(-1), null)
+  assert.equal(isProcessAlive(0), null)
+  assert.equal(isProcessAlive(undefined), null)
+})
+
+test('ensureCardRunning + verifyPid：心跳新鲜但进程没了 -> 必须去拉起（本次修的核心）', async () => {
+  const d = freshDir()
+  const pd = join(d, 'panel')
+  mkdirSync(pd, { recursive: true })
+  writeFileSync(join(pd, 'Panel.ps1'), '# fake', 'utf8')
+
+  // 复现 14:04:56 那一幕：心跳只过去 6 秒（< 8 秒门槛），但进程已经死了
+  writeHb(d, { pid: 39096, alive: true, updatedAtMs: Date.now() - 6000 })
+
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: pd,
+    dataDir: d,
+    log: (m) => logs.push(m),
+    verifyPid: true,
+    isPidAlive: () => false,     // 进程已经不在了
+    graceMs: 0,
+    skipGrace: true,             // pid 都没了，没必要再等 2.6 秒
+    dryRun: true,                // 走完判断但不真起进程
+  })
+
+  assert.notEqual(r.reason, 'already-running', '这就是原来那个 bug：判成"在跑"，于是永远不拉起')
+  assert.ok(logs.some(m => m.includes('那个进程已经不在了')), '日志要说明为什么推翻心跳结论')
+  assert.ok(
+    logs.some(m => /卡片没在跑|确认卡片确实不在了/.test(m)),
+    '必须继续往下走去拉起，而不是停在"已在运行"',
+  )
+})
+
+test('ensureCardRunning + verifyPid：心跳新鲜且进程真在 -> 照旧不重复启动', async () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1234, alive: true, updatedAtMs: Date.now() - 1000 })
+
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: join(TMP, 'whatever'),
+    dataDir: d,
+    log: (m) => logs.push(m),
+    verifyPid: true,
+    isPidAlive: () => true,      // 进程确实活着
+  })
+  assert.equal(r.launched, false)
+  assert.equal(r.reason, 'already-running')
+})
+
+test('ensureCardRunning + verifyPid：判断不了 pid -> 保持原行为（不多起一张）', async () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1234, alive: true, updatedAtMs: Date.now() - 1000 })
+
+  const logs = []
+  const r = await ensureCardRunning({
+    panelDir: join(TMP, 'whatever'),
+    dataDir: d,
+    log: (m) => logs.push(m),
+    verifyPid: true,
+    isPidAlive: () => null,      // 权限不足之类，判断不了
+  })
+  assert.equal(r.launched, false, '查不到不能当成死了')
+  assert.equal(r.reason, 'already-running')
+})
+
+test('ensureCardRunning 默认不查 pid（不打开 verifyPid 时行为不变）', async () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1234, alive: true, updatedAtMs: Date.now() - 1000 })
+
+  let probed = false
+  const r = await ensureCardRunning({
+    panelDir: join(TMP, 'whatever'),
+    dataDir: d,
+    log: () => {},
+    isPidAlive: () => { probed = true; return false },
+  })
+  assert.equal(probed, false, '没打开 verifyPid 就不该多做这次系统调用')
+  assert.equal(r.reason, 'already-running')
+})
+
+group('自动恢复判断：曾经静默的 already-handled 现在必须留日志')
+
+test('already-handled 要有一条日志（以前完全静默，导致事故查不出原因）', () => {
+  // 复现 2026-10-31 14:04:56 那一幕：
+  // 心跳时间戳 14:04:51 早于插件启动时刻 14:04:56 → 被判"旧心跳、不处理"
+  // 修之前：v.log === undefined，76 秒里约 15 轮一句日志都没有。
+  const v = shouldReviveCard(
+    HB({ crashed: true, updatedAtMs: 5000, ageMs: 76000 }),
+    ST({ lastCrashedAt: 9000 }),
+  )
+  assert.equal(v.revive, false)
+  assert.equal(v.reason, 'already-handled')
+  assert.equal(typeof v.log, 'string', '这条分支以前是静默的 —— 就是它让"卡片不见了"查不出原因')
+  assert.match(v.log, /早于本插件启动时刻/, '要说清为什么没处理')
+  assert.equal(v.stamp, 5000, '调用方要靠 stamp 做去重，别每 5 秒刷一条')
+})
+
+
 let passed = 0
 let failed = 0
 const failures = []

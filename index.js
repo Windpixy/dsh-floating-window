@@ -516,6 +516,18 @@ export function apply(ctx, config) {
       dataDir: dir,
       log,
       staleMs: cfg.heartbeatStaleMs,
+      // 【v0.10.4】首次拉起时多核对一步"心跳里那个 pid 还在不在"。
+      //
+      // 【为什么只在这一处打开】
+      //   卡片是 attached 启动的（挂在本机 DSH 进程树里），DSH 一关它就跟着死。
+      //   而"心跳过期"门槛 8 秒 > "DSH 重开"的 10~15 秒里最坏那种情况 ——
+      //   只要重启够快，新插件读到的心跳就还没过期，于是判"卡片在跑"直接跳过拉起，
+      //   屏幕上一张卡都没有，还不自愈。2026-10-31 14:04:56 就是这么发生的：
+      //   日志说「卡片已在运行（pid=39096，心跳 6 秒前）」，而那张卡 5.6 秒前就死了。
+      //
+      //   监控循环（下面的 5 秒定时器）判据不同、有自己的一套去重和复查，
+      //   不在这一版改动范围内。
+      verifyPid: true,
     })
       .then((r) => {
         log('自动拉起结果: ' + JSON.stringify({ ok: r.ok, launched: r.launched, reason: r.reason, mode: r.mode }))
@@ -565,13 +577,30 @@ export function apply(ctx, config) {
 
   ctx.effect(() => {
     let wasAlive = false
-    // 起始值 = 插件起来的时刻。
-    // 目的：开机时那条**上一次运行留下的**过期心跳不算"新崩溃"
-    // （那种情况上面的 autoLaunch 已经在处理，这里再插一脚会重复启两次）。
-    // 之后任何一次真崩溃，心跳里最后的时间戳一定晚于这个起点，能被正常识别。
-    let lastCrashedAt = Date.now()
+    // 起始值 = 插件起来的时刻再往前推一个"心跳过期门槛"。
+    //
+    // 【目的（保持不变）】
+    //   开机时那条**上一次运行留下的**过期心跳不算"新崩溃"
+    //   （那种情况上面的 autoLaunch 已经在处理，这里再插一脚会重复启两次）。
+    //
+    // 【v0.10.4 为什么要往前推 staleMs —— 一个真 bug】
+    //   原来这里是 `let lastCrashedAt = Date.now()`，等于"凡是在插件启动之前
+    //   打的时间戳，一律当成已经处理过"。这有个致命的副作用：
+    //     · 卡片在插件起来前几秒刚死（attached 模式下 DSH 一关它就是这种死法）
+    //     · 心跳时间戳 = 死亡时刻，必然早于插件启动时刻
+    //     → 被判成"上一次运行留下的旧心跳" → **永不重开，而且一句日志都不写**
+    //
+    //   实测（plugin.log 2026-10-31）：14:04:56 插件起来，卡片 14:04:51 死，
+    //   之后 76 秒里监控循环跑了约 15 轮，零日志、零动作，屏幕上一张卡都没有。
+    //
+    //   往前推 staleMs（8 秒）之后："插件启动前 8 秒内死掉的卡片"会被当成
+    //   真正需要处理的一次崩溃；只有更早那些才是"上一次运行留下的"。
+    //   这个窗口刚好等于"心跳过期门槛"，语义上也对得上。
+    let lastCrashedAt = Date.now() - (cfg.heartbeatStaleMs ?? 8000)
     let reviveCount = 0
     let reviving = false
+    // 已经为哪个时间戳写过"这种情况不处理"的日志（避免每 5 秒刷一条）
+    let alreadyHandledLoggedAt = 0
 
     // ---------------------------------------------------------- 旧代码自动重启（v0.9.12）
     //
@@ -711,7 +740,23 @@ export function apply(ctx, config) {
         //   只如实描述"心跳看着不对、正在复查"。
         //   "异常退出 / 卡片确实不在了"这类结论，一律留到复查确认之后写
         //   （见下面 .then 里的两处）。
-        if (verdict.log) log(verdict.log)
+        //
+        // 【v0.10.4：already-handled 那条要去重，其余照写】
+        //   2026-10-31 实测：卡片 14:04:51 死、插件 14:04:56 起，
+        //   心跳时间戳早于插件启动时刻 → 每 5 秒命中 already-handled 一次。
+        //   以前这条完全静默（查不出原因），现在必须有日志；
+        //   但它每 5 秒会重复出现，所以要按时间戳去重，只写第一次。
+        if (verdict.log) {
+          if (verdict.reason === 'already-handled') {
+            if (verdict.stamp !== alreadyHandledLoggedAt) {
+              alreadyHandledLoggedAt = verdict.stamp
+              log(verdict.log)
+            }
+          }
+          else {
+            log(verdict.log)
+          }
+        }
 
         if (verdict.revive) {
           lastCrashedAt = verdict.stamp
