@@ -18,7 +18,7 @@ import { StateWriter } from './lib/writer.js'
 import { DEFAULTS, dataDir, dataPaths, panelDir } from './lib/paths.js'
 import { createLogger } from './lib/logger.js'
 import { registerSources, backfill, syncExistingSessions } from './lib/sources.js'
-import { ensureCardRunning, checkHeartbeat, shouldReviveCard, judgeCardStaleness, shouldRestartForUpdate, readPanelStampMs, stopCardByHeartbeat } from './lib/launcher.js'
+import { ensureCardRunning, checkHeartbeat, shouldReviveCard, judgeCardStaleness, shouldRestartForUpdate, readPanelStampMs, stopCardByHeartbeat, waitForPreviousCardExit } from './lib/launcher.js'
 import { startDemo } from './lib/demo.js'
 import { HolidayStore, nextSwitch } from './lib/valley.js'
 import { createApprovalProxy } from './lib/approval-proxy.js'
@@ -676,25 +676,66 @@ export function apply(ctx, config) {
             const stopResult = stopCardByHeartbeat(dir)
             log('停止旧卡片: ' + stopResult.reason)
 
-            // 给旧进程一点退出时间，再拉起。
-            // 卡片退出时会写 alive=false 心跳，所以拉起时单实例保护不会拦。
-            setTimeout(() => {
-              ensureCardRunning({ panelDir: cardDir, dataDir: dir, log, staleMs: cfg.heartbeatStaleMs })
-                .then((r) => {
-                  log('因代码更新重启结果: ' + JSON.stringify({ ok: r.ok, launched: r.launched, reason: r.reason }))
-                  if (!r.ok) {
-                    // 拉起失败要把次数退回去，否则重试预算被白白消耗
-                    restartCount = Math.max(0, restartCount - 1)
-                    lastRestartAt = undefined
-                  }
+            // ================================================================
+            // 【v0.10.9 · C3】不再固定等 1200ms，改成"等到确实能启动"
+            //
+            // 【原来为什么是 1200ms，以及为什么它不够】
+            //   见 launcher.js 里 waitForPreviousCardExit 上方那段长注释。
+            //   一句话：强杀不写 alive=false，心跳要 8 秒才过期，
+            //   而 1.2 秒后拉起的新卡片会被这份"新鲜的旧心跳"挡住 → 自杀。
+            //   实测空窗约 13 秒。
+            //
+            // 【现在怎么判】
+            //   旧 PID 已不存在 **且** 属于旧 PID 的心跳已失效
+            //   （alive=false / 被新 PID 替换 / 按 staleMs 判过期）。
+            //   用户 2026-11-02 拍板选的就是这一条。
+            //
+            // 【超时了怎么办 —— 这里必须想清楚】
+            //   waitForPreviousCardExit 超时返回 ready=false。
+            //   不能"超时也硬启动"（那正是原来 1.2 秒的问题），
+            //   也不能永远不动（卡片就再也不回来了）。
+            //   选择：**仍然尝试拉起**，但明确记一条 WARN。
+            //   理由：卡片自己的单实例保护会兜底 —— 最坏情况是新进程起来后
+            //   发现心跳新鲜、安静退出，等于白跑一次，但不会叠出两张窗。
+            //   而不启动的后果是卡片彻底消失，那严重得多。
+            //   这条取舍写在这里，将来有人调整时能看到为什么。
+            // ================================================================
+            const oldPid = stopResult.pid
+
+            waitForPreviousCardExit({
+              oldPid,
+              dataDir: dir,
+              staleMs: cfg.heartbeatStaleMs,
+              log,
+            })
+              .then((exit) => {
+                if (exit.ready !== true) {
+                  log('警告: ' + exit.reason + ' —— 仍然尝试拉起（单实例保护会兜底）')
+                } else if (exit.waitedMs > 0) {
+                  log(`旧卡片已退出（等了 ${exit.waitedMs} ms），开始拉起新卡片`)
+                }
+
+                return ensureCardRunning({
+                  panelDir: cardDir,
+                  dataDir: dir,
+                  log,
+                  staleMs: cfg.heartbeatStaleMs,
                 })
-                .catch((e) => {
-                  log('因代码更新重启异常: ' + (e && e.message))
+              })
+              .then((r) => {
+                log('因代码更新重启结果: ' + JSON.stringify({ ok: r.ok, launched: r.launched, reason: r.reason }))
+                if (!r.ok) {
+                  // 拉起失败要把次数退回去，否则重试预算被白白消耗
                   restartCount = Math.max(0, restartCount - 1)
                   lastRestartAt = undefined
-                })
-                .finally(() => { restarting = false })
-            }, 1200)
+                }
+              })
+              .catch((e) => {
+                log('因代码更新重启异常: ' + (e && e.message))
+                restartCount = Math.max(0, restartCount - 1)
+                lastRestartAt = undefined
+              })
+              .finally(() => { restarting = false })
           }
         } catch (e) {
           // 旧代码检测是"锦上添花"，任何异常都不能影响主流程
