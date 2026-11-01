@@ -1,26 +1,30 @@
 # dsh-floating-window · DSH 状态悬浮窗
 
-[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)](#先看这里仅支持-windows)
-[![DSH](https://img.shields.io/badge/DSH-plugin-4B6BFB)](https://github.com/Windpixy/dsh-floating-window)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
-**一块浮在桌面上的磨砂玻璃小窗，实时告诉你 DSH 正在干什么。**
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)
+
+![DSH](https://img.shields.io/badge/DSH-plugin-4B6BFB)
+
+**一块浮在桌面上的磨砂玻璃小窗，实时告诉你 DSH 正在干什么。  
+不做花哨皮肤，只从实用性出发，简单有时就是最好的。**
 
 不切窗口、不打断手上在做的事 —— 抬头扫一眼就知道：
 
-- 现在有几个任务在跑、每个任务跑到第几分钟、正在处理什么文件
+- 现在有几个任务在跑、每个任务跑到第几分钟、正在处理什么文件、  
+  **这个任务已经烧掉多少 Token**
 - 有没有**等你审批**的事（要执行删除、改系统之类操作时会停下来问你）
-- 今天已经用掉多少 Token、距离「谷时」结束还有多久
-  （谷时是 DeepSeek 的低价时段，同样用量更便宜；
-  时间段是工作日的 9-12 点、14-18 点之外，加上周末和法定节假日全天，
+- 今天已经用掉多少 Token、距离「谷时」结束还有多久  
+  （谷时是 DeepSeek 的低价时段，同样用量更便宜；  
+  时间段是工作日的 9-12 点、14-18 点之外，加上周末和法定节假日全天，  
   插件会自己判断，节假日也从网上自动更新，不用你填）
 
-> **⚠️ 只支持 Windows 10 / Windows 11。** 在 Mac 和 Linux 上装得上、但卡片不会出现。
+> **⚠️ 只支持 Windows 10 / Windows 11。** 在 Mac 和 Linux 上装得上、但卡片不会出现。  
 > 原因见下面「[先看这里：仅支持 Windows](#先看这里仅支持-windows)」。
 
 ![卡片态：3 个任务正在运行，底部显示今日 Token 和谷时倒计时](https://raw.githubusercontent.com/Windpixy/dsh-floating-window/main/docs/card-running.png)
 
-不想让卡片占地方的时候，右键点「缩成细条」，它就变成一根**细柱**贴在屏幕边缘，
+不想让卡片占地方的时候，右键点「缩成细条」，它就变成一根**细柱**贴在屏幕边缘，  
 几乎不占位置；鼠标移上去才弹出气泡，看一眼就走。
 
 ![柱态：一根细柱贴在屏幕边缘](https://raw.githubusercontent.com/Windpixy/dsh-floating-window/main/docs/bar.png)
@@ -33,7 +37,7 @@
 
 **这个插件只能在 Windows 10 / Windows 11 上工作。**
 
-窗口本体是用 **PowerShell + WPF**（Windows 自带的界面技术）画出来的真·磨砂玻璃窗口，
+窗口本体是用 **PowerShell + WPF**（Windows 自带的界面技术）画出来的真·磨砂玻璃窗口，  
 用到了只有 Windows 才有的系统能力。
 
 在 macOS / Linux 上会发生什么：
@@ -42,7 +46,7 @@
 - 但**卡片永远不出现**
 - 插件日志里只有一句 `两种启动策略都没成功。请手动跑 panel\run-panel.bat 看报错。`
 
-这句话对不熟悉的人完全没有帮助，所以在这里先写死：
+这句话对不熟悉的人完全没有帮助，所以在这里先写死：  
 **看不到卡片，先确认你在 Windows 上。**
 
 ---
@@ -75,31 +79,31 @@
 
 下面三种方式任选一种，效果一样。
 
-> **`<你的 profile>` 是什么？**
-> `profile` 就是"插件装到哪个配置夹里"的名字。
-> 打开 DSH，侧栏点「插件」，页面上能看到当前 profile 的名字。
+> **`<你的 profile>` 是什么？**  
+> `profile` 就是"插件装到哪个配置夹里"的名字。  
+> 打开 DSH，侧栏点「插件」，页面上能看到当前 profile 的名字。  
 > 不确定就随便用一个你在用的名字，DSH 会在第一次使用时自动建好它。
 
 ### 方式一：命令行，从 npm 装（推荐）
 
 ```bash
-dsh plugin --profile <你的 profile> add dsh-floating-window@0.9.15
+dsh plugin --profile <你的 profile> add dsh-floating-window@0.10.7
 ```
 
-> ⚠️ **这条命令里的版本号必须写精确的**（`@0.9.15` 这种），不能只写包名。
+> ⚠️ **这条命令里的版本号必须写精确的**（`@0.10.7` 这种），不能只写包名。
 >
-> 原因：pnpm 11 有个「新版本等待期」机制（`minimumReleaseAge`，默认 **1440 分钟 = 1 天**）。
-> 一个版本发布后不到这个时间，pnpm 会认为它"太新、还在观察期"而**不去装它**。
-> 而你只写包名时，安装范围是"任意版本"，pnpm 就**默默往下退到某个老版本**，
+> 原因：pnpm 11 有个「新版本等待期」机制（`minimumReleaseAge`，默认 **1440 分钟 = 1 天**）。  
+> 一个版本发布后不到这个时间，pnpm 会认为它"太新、还在观察期"而**不去装它**。  
+> 而你只写包名时，安装范围是"任意版本"，pnpm 就**默默往下退到某个老版本**，  
 > 而且**退出码是 0** —— 命令行上看不出任何异常，看起来完全成功。
 >
-> 结果就是你装了、没报错，实际跑的是旧版，出问题能查很久。
-> 写上精确版本号就没有"往下退"的空间了，只能装这一版（或者明确报错），
+> 结果就是你装了、没报错，实际跑的是旧版，出问题能查很久。  
+> 写上精确版本号就没有"往下退"的空间了，只能装这一版（或者明确报错），  
 > 不会出现"看着成功其实装错"。
 >
-> 另一种办法：把包名加进 profile 的 `pnpm-workspace.yaml` 的
-> `minimumReleaseAgeExclude` 列表里，让它不受这个等待期限制。
-> 那个文件里本来就有一串这样的例外（都是之前手加的），照着加一行
+> 另一种办法：把包名加进 profile 的 `pnpm-workspace.yaml` 的  
+> `minimumReleaseAgeExclude` 列表里，让它不受这个等待期限制。  
+> 那个文件里本来就有一串这样的例外（都是之前手加的），照着加一行  
 > `- dsh-floating-window` 就行。
 
 ### 方式二：命令行，从 GitHub 装（不用 npm 的备选）
@@ -117,7 +121,7 @@ dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 1. 打开 DSH，左侧栏点 **「插件」**
 2. 点 **「添加插件」**
 3. 在输入框里填下面任意一种：
-   - **包名**：`dsh-floating-window@0.9.15` ← 推荐
+   - **包名**：`dsh-floating-window@0.10.7` ← 推荐
    - **Git 地址**：`github:Windpixy/dsh-floating-window`
    - 打包好的压缩包路径
    - 本地文件夹的绝对路径（自己改了代码想试效果时用这个）
@@ -127,13 +131,14 @@ dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 ### 装完之后你应该看到什么
 
 - 屏幕右侧出现一块磨砂玻璃卡片（不是纯色方块 —— 能透出背后的壁纸）
-- 有任务在跑时，卡片上按行列出任务名、已跑时间、正在做什么
+- 有任务在跑时，卡片上按行列出任务名、已跑时间、正在做什么，  
+  以及**这个任务已经用掉的 Token**（右下角小字，像 `12.3k Token`）
 - 没有任务时，卡片缩成一行，轮流显示「今日 Token」和「谷时倒计时」
 
 ![空闲时轮播显示今日 Token 用量](https://raw.githubusercontent.com/Windpixy/dsh-floating-window/main/docs/card-token.png)
 
-**如果什么都没出现**：先确认是 Windows，再打开插件日志
-`%USERPROFILE%\.dsh\desktop-card\plugin.log`，最后的手段是手动双击
+**如果什么都没出现**：先确认是 Windows，再打开插件日志  
+`%USERPROFILE%\.dsh\desktop-card\plugin.log`，最后的手段是手动双击  
 `面板目录\panel\run-panel.bat`，它会用控制台窗口启动卡片，报错能直接看到。
 
 ### 以后怎么更新
@@ -144,7 +149,7 @@ dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 ```
 
-更新完重启 DSH。如果卡片还在屏幕上、没跟着更新，它会**自己发现跑的是旧代码并重启一次**
+更新完重启 DSH。如果卡片还在屏幕上、没跟着更新，它会**自己发现跑的是旧代码并重启一次**  
 （机制见下面「改了代码，卡片会自动重启」），不用手动去关它。
 
 如果命令提示"已经装过了"，先 remove 再 add：
@@ -164,10 +169,10 @@ dsh plugin --profile <你的 profile> remove dsh-floating-window
 
 > ⚠️ **卸载插件不会关掉已经开着的卡片窗口。**
 >
-> 卡片是一个**脱离了 DSH 进程树的独立常驻进程**（这是故意的：这样你关掉 DSH，
+> 卡片是一个**脱离了 DSH 进程树的独立常驻进程**（这是故意的：这样你关掉 DSH，  
 > 卡片还能留着）。所以"删插件"和"关窗口"是两件事。
 >
-> 卸载之后请**右键卡片 → 退出**，否则那块窗口会一直飘在桌面上，
+> 卸载之后请**右键卡片 → 退出**，否则那块窗口会一直飘在桌面上，  
 > 而且因为插件已经卸了，它读不到新数据，会一直停在最后一帧。
 
 卸载只删程序，不删你的数据。想连设置和日志一起清掉，手动删这个文件夹：
@@ -182,34 +187,56 @@ dsh plugin --profile <你的 profile> remove dsh-floating-window
 
 ### 鼠标操作
 
-| 操作 | 效果 |
-|---|---|
-| **单击卡片** | 跳回 DSH 主窗口 |
-| **拖动卡片** | 移动位置，松手会记住；开着"贴边"时会自动吸附到屏幕边缘 |
+| 操作       | 效果                                                            |
+| -------- | ------------------------------------------------------------- |
+| **单击卡片** | 跳回 DSH 主窗口                                                    |
+| **拖动卡片** | 移动位置，松手会记住；开着"贴边"时会自动吸附到屏幕边缘                                  |
 | **右键卡片** | 打开菜单：设置… / 置顶 / 回到 DSH / 缩成细条 / 回到默认位置 / 重新读取设置 / 导出诊断包… / 退出 |
 
 ### 设置界面
 
-右键卡片 → **设置…**，打开的就是下面这个窗口。拖滑块 → 点「保存」，
+右键卡片 → **设置…**，打开的就是下面这个窗口。拖滑块 → 点「保存」，  
 卡片会在半秒内自己套用新设置，**不用重启 DSH，也不用关掉卡片**。
 
 ![卡片设置界面：磨砂浓度、轮播间隔、卡片宽度、收起高度、行为开关、审批分组](https://raw.githubusercontent.com/Windpixy/dsh-floating-window/main/docs/card-settings.png)
 
 界面上能改的东西：
 
-| 分组 | 项目 | 说明 |
-|---|---|---|
-| 外观 | 磨砂浓度（24~144） | 往左更透（看得见壁纸）、往右更奶白（字更清楚） |
-| 外观 | 轮播间隔（5~120 秒） | 空闲小扁条在「今日 Token」和「谷时倒计时」之间多久换一次 |
-| 尺寸 | 卡片宽度（200~360） | 默认 260 |
-| 尺寸 | 收起高度（72~160） | 空闲收缩后的高度，默认 96 |
-| 行为 | 点卡片回到 DSH | 开关；关掉后点卡片没反应 |
-| 行为 | 贴到屏幕边缘 | 开关；拖动松手自动吸附 |
-| 行为 | 贴边留白（0~60 像素） | 只在上面那个开关开着时有效 |
-| 审批 | 在悬浮窗上直接审批 | **默认关**，安全原因见下面「[审批相关的两个开关](#审批相关的两个开关安全相关请看完再打开)」 |
-| 审批 | 点「允许」前再确认一次 | 默认开，防止误点 |
-| 峰谷 | （只读） | 显示当前是不是谷时、判断规则是什么，不用你填 |
-| 状态 | （只读） | 卡片在不在跑、DSH 地址有没有同步成功，排查时看这一块 |
+| 分组 | 项目            | 说明                                                 |
+| -- | ------------- | -------------------------------------------------- |
+| 外观 | 磨砂浓度（24~144）  | 往左更透（看得见壁纸）、往右更奶白（字更清楚）                            |
+| 外观 | 轮播间隔（5~120 秒） | 空闲小扁条在「今日 Token」和「谷时倒计时」之间多久换一次                    |
+| 尺寸 | 卡片宽度（200~360） | 默认 260                                             |
+| 尺寸 | 收起高度（72~160）  | 空闲收缩后的高度，默认 96                                     |
+| 行为 | 点卡片回到 DSH     | 开关；关掉后点卡片没反应                                       |
+| 行为 | 贴到屏幕边缘        | 开关；拖动松手自动吸附                                        |
+| 行为 | 贴边留白（0~60 像素） | 只在上面那个开关开着时有效                                      |
+| 审批 | 在悬浮窗上直接审批     | **默认关**，安全原因见下面「[审批相关的两个开关](#审批相关的两个开关安全相关请看完再打开)」 |
+| 审批 | 点「允许」前再确认一次   | 默认开，防止误点                                           |
+| 峰谷 | （只读）          | 显示当前是不是谷时、判断规则是什么，不用你填                             |
+| 状态 | （只读）          | 卡片在不在跑、DSH 地址有没有同步成功，排查时看这一块                       |
+
+### 任务行上的 Token 数字
+
+每个任务行的**右下角**会显示这个任务**已经用掉多少 Token**，格式像 `12.3k Token`。
+
+```
+┌────────────────────────────────────┐
+│ 账号体系1期                  4秒  │  ← 任务名 + 已跑时长
+│ 正在运行              12.3k Token  │  ← 正在做什么 + 这个任务的 Token
+└────────────────────────────────────┘
+```
+
+几个需要注意的地方：
+
+- **这是「这个任务」的用量，不是「今日总量」**。底部那行的「今日 XXX Token」是全天合计。
+- **包含子代理**。如果一个任务派了子代理去干活，子代理用掉的 Token 也算在这个任务名下  
+  （因为子代理是独立会话，不合并的话，会出现"底部写今日 3M、任务行只有 1.5k"的错觉）。
+- **数字为 0 时不显示**，不会写 `0 Token` —— 那看起来像"这个任务真的一点都没用"，  
+  但更可能是这条数据还没到。
+- 跨天会归零（跟底部「今日」同一个口径）。
+
+> 这个数字来自插件按会话统计的 Token 账本，卡片每 500ms 跟着主循环刷一次，不用手动刷新。
 
 ### 柱态（细柱）
 
@@ -217,12 +244,12 @@ dsh plugin --profile <你的 profile> remove dsh-floating-window
 
 柱子只有一条色条，看颜色就知道现在是什么状态：
 
-| 色条颜色 | 意思 |
-|---|---|
-| 🔵 蓝 | 有任务正在跑 |
+| 色条颜色 | 意思          |
+| ---- | ----------- |
+| 🔵 蓝 | 有任务正在跑      |
 | 🔴 红 | 有事在**等你审批** |
-| 🟢 绿 | 刚刚有任务完成 |
-| ⚪ 灰 | 空闲 |
+| 🟢 绿 | 刚刚有任务完成     |
+| ⚪ 灰  | 空闲          |
 
 - 任务跑起来时，色条会像呼吸一样明暗起伏 —— 一眼区分"在跑"和"卡住了"
 - **单击柱子**展开回卡片
@@ -231,15 +258,15 @@ dsh plugin --profile <你的 profile> remove dsh-floating-window
 
 ### 深色壁纸下会自动换配色
 
-卡片会读取背后壁纸的明暗，自动把文字从黑色换成白色，保证看得清。
+卡片会读取背后壁纸的明暗，自动把文字从黑色换成白色，保证看得清。  
 不用你手调。
 
 ![深色壁纸下的卡片：文字自动变白](https://raw.githubusercontent.com/Windpixy/dsh-floating-window/main/docs/card-dark.png)
 
 ### 更多状态
 
-任务多的时候卡片会自动长高（最多 5 行），子智能体也单独计数；
-只有一个任务时，标题行直接显示「正在运行」；
+任务多的时候卡片会自动长高（最多 5 行），子智能体也单独计数；  
+只有一个任务时，标题行直接显示「正在运行」；  
 同一时刻有多个会话在跑时，每行一个任务，各带自己的计时。
 
 这些状态的截图都收在 [docs/screenshots.md](docs/screenshots.md)。
@@ -256,7 +283,7 @@ dsh plugin --profile <你的 profile> remove dsh-floating-window
 
 ## 为什么这样分工
 
-窗口本体是一个独立的磨砂玻璃容器（PowerShell + WPF），打包在插件的 `panel/` 里。
+窗口本体是一个独立的磨砂玻璃容器（PowerShell + WPF），打包在插件的 `panel/` 里。  
 插件只负责两件事：
 
 1. **把 DSH 的真实状态写进 `state.json`** —— 窗口每 500ms 读一次
@@ -312,9 +339,9 @@ dsh-floating-window/
 └── locale/ icon.svg
 ```
 
-> `test/` 目录**不包含在 npm 包里**（`package.json` 的 `files` 白名单没列它）。
-> 所以下面「开发」章节里的测试命令，**只对从 GitHub clone 下来的源码仓库有效**。
-> `docs/` 里的截图同样没进 npm 包 —— 这份说明以 GitHub 为主场，
+> `test/` 目录**不包含在 npm 包里**（`package.json` 的 `files` 白名单没列它）。  
+> 所以下面「开发」章节里的测试命令，**只对从 GitHub clone 下来的源码仓库有效**。  
+> `docs/` 里的截图同样没进 npm 包 —— 这份说明以 GitHub 为主场，  
 > 在 npm 页面上看时图可能是坏的，不影响插件本身。
 
 ---
@@ -326,20 +353,20 @@ dsh-floating-window/
 - **程序**在插件的 `panel/` 里，跟着插件一起升级
 - **数据**在 `%USERPROFILE%\.dsh\desktop-card\`
 
-| 文件 | 作用 |
-|---|---|
-| `state.json` | 插件写、卡片读的状态 |
-| `panel-pos.json` | 卡片位置记忆 |
+| 文件               | 作用                                      |
+| ---------------- | --------------------------------------- |
+| `state.json`     | 插件写、卡片读的状态                              |
+| `panel-pos.json` | 卡片位置记忆                                  |
 | `heartbeat.json` | 卡片每 2 秒报告"我还活着 + 进程号 + 窗口句柄 + 加载的代码时间戳" |
-| `tokens.json` | 今日 Token 缓存 |
-| `plugin.log` | 插件日志（超过 1MB 自动轮转） |
-| `settings.json` | 卡片的外观配置（首次启动从 `panel/` 复制） |
-| `holidays.json` | 节假日缓存（从网上拉取后落盘，断网也能用） |
-| `decisions/` | 悬浮窗审批的「决定文件」目录（v0.8.0 起） |
+| `tokens.json`    | 今日 Token 缓存                             |
+| `plugin.log`     | 插件日志（超过 1MB 自动轮转）                       |
+| `settings.json`  | 卡片的外观配置（首次启动从 `panel/` 复制）              |
+| `holidays.json`  | 节假日缓存（从网上拉取后落盘，断网也能用）                   |
+| `decisions/`     | 悬浮窗审批的「决定文件」目录（v0.8.0 起）                |
 
 所以插件目录里没有运行数据，`git status` 永远是干净的。
 
-> 注：数据目录叫 `desktop-card` 是历史原因 —— 插件以前叫 `dsh-desktop-card`。
+> 注：数据目录叫 `desktop-card` 是历史原因 —— 插件以前叫 `dsh-desktop-card`。  
 > 改名时**故意没改数据目录**，这样老用户的设置、位置记忆、日志全都还在，不需要迁移。
 
 ---
@@ -354,7 +381,7 @@ dsh-floating-window/
   "tasks": {
     "running": 2,
     "sessions": [
-      { "title": "重构登录模块", "elapsedSec": 431, "activity": "正在处理 auth.ts" }
+      { "title": "重构登录模块", "elapsedSec": 431, "activity": "正在处理 auth.ts", "tokens": 12340 }
     ]
   },
   "approval": {
@@ -369,6 +396,8 @@ dsh-floating-window/
 - `tasks.sessions` 可省略；卡片缺字段时显示"N 个任务运行中"
 - `sessions` 超过 5 条时第 5 行变"还有 N 个"
 - `lastFinished` 为空或 `null` = 没有刚完成的任务
+- `tasks.sessions[].tokens` 是**这个任务（含它派生的子会话）今天用掉的 Token**，  
+  卡片画在行右下角。v0.10.0 起才有；老版本的 `state.json` 里没这个字段，卡片会自动不显示。
 
 ---
 
@@ -378,17 +407,17 @@ dsh-floating-window/
 
 在 profile 的 `cordis.patch.yml` 的 `config` 里改，**改完要重启 DSH**：
 
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `autoLaunch` | `true` | DSH 启动时自动拉起卡片 |
-| `showSubagentSessions` | `false` | 子代理会话是否也显示为任务 |
-| `maxTaskRows` | `5` | 卡片最多显示几行。注意卡片侧目前写死上限 5，这个键暂时不生效 |
-| `writeThrottleMs` | `500` | `state.json` 最快写入间隔 |
-| `backfillTodayTokens` | `true` | 启动时回填今天已用的 Token |
-| `heartbeatStaleMs` | `8000` | 心跳多久没更新算卡片已退出 |
-| `useDemoData` | `false` | 演示模式：用假数据轮流切换五种状态 |
-| `dataDir` | `%USERPROFILE%\.dsh\desktop-card` | 数据目录 |
-| `panelDir` | 插件内的 `panel/` | 卡片程序目录（一般不用改） |
+| 键                      | 默认                                | 说明                              |
+| ---------------------- | --------------------------------- | ------------------------------- |
+| `autoLaunch`           | `true`                            | DSH 启动时自动拉起卡片                   |
+| `showSubagentSessions` | `false`                           | 子代理会话是否也显示为任务                   |
+| `maxTaskRows`          | `5`                               | 卡片最多显示几行。注意卡片侧目前写死上限 5，这个键暂时不生效 |
+| `writeThrottleMs`      | `500`                             | `state.json` 最快写入间隔             |
+| `backfillTodayTokens`  | `true`                            | 启动时回填今天已用的 Token                |
+| `heartbeatStaleMs`     | `8000`                            | 心跳多久没更新算卡片已退出                   |
+| `useDemoData`          | `false`                           | 演示模式：用假数据轮流切换五种状态               |
+| `dataDir`              | `%USERPROFILE%\.dsh\desktop-card` | 数据目录                            |
+| `panelDir`             | 插件内的 `panel/`                     | 卡片程序目录（一般不用改）                   |
 
 示例：
 
@@ -399,6 +428,7 @@ dsh-floating-window/
     autoLaunch: true
     showSubagentSessions: false
 ```
+
 
 ### 卡片外观设置放哪
 
@@ -432,6 +462,7 @@ dsh-floating-window/
 | 任务标题 | `session/title` 事件；回填时从会话日志翻，另有标题缓存 |
 | 跑了多久 | 开跑时记时间戳，现算 |
 | 正在做什么 | `tool/call` 事件，工具名翻中文 + 抠文件名 |
+| **任务行右下角的 Token** | `assistant/message.usage` 按 `sessionId` 分别累加（**含子代理**），v0.10.0 起 |
 | 待审批 | `approval/asked` / `approval/decided` 事件 |
 | 今日 Token | `assistant/message.usage` 累加 + 启动时回填 |
 | 刚完成绿点 | 会话从跑变停的那一刻 |
@@ -564,9 +595,9 @@ node test/check-card-staleness.mjs
 纯逻辑单测，**不需要 DSH、不需要重启**：
 
 ```bash
-node test/unit.mjs              # 状态换算 62 项
-node test/tokens.mjs            # Token 账本 17 项
-node test/launcher.mjs          # 拉起判断 + 崩溃识别 32 项
+node test/unit.mjs              # 状态换算 74 项
+node test/tokens.mjs            # Token 账本（含按会话统计）35 项
+node test/launcher.mjs          # 拉起判断 + 崩溃识别 83 项
 node test/valley.mjs            # 峰谷算法 76 项
 node test/endpoint.mjs          # 地址解析 77 项
 node test/writer-race.mjs       # 原子写盘竞争 7 项
@@ -576,16 +607,20 @@ node test/approval-proxy.mjs    # 悬浮窗审批代理 85 项
 node test/bar-mode.mjs          # 柱态界面 336 项
 node test/freshness.mjs         # 旧代码检测 + 自动重启判据 24 项
 node test/logger.mjs            # 日志轮转与去重 91 项
+node test/staleness-chain.mjs   # 旧代码检测整链（含字段传递）20 项
 ```
 
-合计 **838 项，全部不需要 DSH**。
+合计 **939 项，全部不需要 DSH**。
+
+> 上面的项数是写这份文档时实测的。**判断标准永远是「失败 0」，不是「正好 939」**——
+> 每加一个功能这个总数就会变，别拿它当验收依据。
 
 懒得一条条敲，可以一把跑完（PowerShell）：
 
 ```powershell
 foreach ($f in 'unit','tokens','launcher','valley','endpoint','writer-race',
                'plugin-wire','revive-e2e','approval-proxy','bar-mode',
-               'freshness','logger') {
+               'freshness','logger','staleness-chain') {
   Write-Host "=== $f ===" -ForegroundColor Cyan
   node "test/$f.mjs"
 }
@@ -637,7 +672,7 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File test/m4-acceptance.ps1 
 - [x] M4 完整验收（六档高度 / 磨砂 / 内存 / 五种状态 全通过）
 - [x] M5 打包发布（git 仓库 + 干净环境安装验证）
 
-上线后还修了四轮实测问题：
+上线后修过的实测问题（按发现顺序）：
 
 | 轮次 | 现象 | 真实原因 |
 |---|---|---|
@@ -645,11 +680,22 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File test/m4-acceptance.ps1 
 | 二 | 点卡片没反应；底部文字偏上 | `dsh://` 不会激活已有窗口；行高分配错 6 像素 |
 | 三 | 点卡片后卡片凭空消失 | 定时器读不到函数局部变量，异常崩掉整个进程 |
 | 四 | 卡片根本不出现 | `package.json` 带 BOM，插件没被 DSH 加载 |
+| 五 | 卡片消失后**永不恢复**（睡眠唤醒触发） | `detached` 启动白等 6 秒；睡眠唤醒被误判成卡片崩溃 |
+| 六 | 卡片消失后**永不恢复**（心跳读不到触发） | 心跳文件读不到时被当成"用户主动关了"，于是不再拉起 |
+| 七 | 睡醒后日志误报"卡片崩溃" | 措辞在复查之前就下结论，实际只是睡眠 |
+| 八 | 打开 DSH 时先闪一张纯黑卡片 | 窗口首帧还没就绪就显示出来了 |
+| 九 | 卡片抓屏失败（两种不同形态） | 抓屏时机与重试逻辑，两种情况要分别处理 |
+| 十 | **自动"旧代码检测"失效**，改了代码不重启卡片 | 心跳里没带 `scriptStampMs` 字段，检测链路断了 |
 
-之后陆续补了：柱态（缩成细条）、悬浮窗审批、子代理状态显示、置顶、
-图形化设置界面、日志功能、深色壁纸自适应、代码更新自动重启。
+> 五～十 都是"卡片看起来还在、但功能不对"这类最难查的问题：
+> 没有报错，日志也正常，现象和"新功能写错了"一模一样。
+> 所以每次修完都补了针对性测试（`launcher` 从 32 项涨到 83 项，另外新增 `staleness-chain` 20 项）。
 
-本版本 **v0.9.15**。
+之后陆续补的**功能**：柱态（缩成细条）、悬浮窗审批、子代理状态显示、置顶、
+图形化设置界面、日志功能、深色壁纸自适应、代码更新自动重启、
+**任务行显示本次会话 Token**（v0.10.0）。
+
+本版本 **v0.10.7**。
 
 ---
 
