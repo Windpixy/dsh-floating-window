@@ -1464,21 +1464,179 @@ function Read-SharedText {
     }
 }
 
+# ---------------------------------------------------------------- 状态健康（v0.10.8 · C2）
+#
+# 【这个函数解决什么问题 —— 一个"看起来正常"的骗局】
+#
+#   改造之前，Read-PanelState 在下面四种情况下**统一返回 0 任务 / 0 审批 / 0 Token**：
+#     · state.json 不存在
+#     · 读取失败（被锁、权限受限）
+#     · JSON 解析失败（插件写了一半 / 文件损坏）
+#     · 插件停了，没人再更新文件
+#
+#   结果：「DSH 真的没事做」和「卡片根本拿不到数据」在屏幕上一模一样 ——
+#   都显示"空闲"。用户的卡片写着"空闲"，其实插件早就挂了，还蒙在鼓里。
+#
+#   反过来还有另一种坑：插件停了，卡片一直显示最后一次的旧数字，
+#   用户以为还是新数据。
+#
+# 【怎么解决】
+#   把"健康判断"抽成一个**纯函数**，不在里面碰任何 WPF 控件。
+#   这样它可以被 test/c2-state-health.ps1 单独加载测试，
+#   不需要真的弹出一张卡片。
+#
+#   六种判定：
+#     ok          读到合法 JSON，且新鲜           → 可以正常显示（包括"真空闲"）
+#     missing     文件不存在                      → 不能显示空闲
+#     readError   文件在但读不出来（被锁/权限）   → 不能显示空闲
+#     invalidJson 内容不是合法 JSON               → 不能显示空闲
+#     stale       读到了，但 updatedAt 太久没动   → 保留旧内容 + 轻提示
+#     timeAnomaly updatedAt 在未来（时钟被改过）  → 不提示（不是数据问题）
+#
+# 【为什么阈值是 15 秒 —— 用户 2026-11-02 拍板】
+#   卡片主循环 500ms 读一次、插件 1 秒兜底刷新，正常情况每秒都在变。
+#   15 秒 ≈ 正常刷新间隔的 15 倍：
+#     · 足够大，躲得开"插件写文件瞬间撞上卡片读"这类几十毫秒的抖动
+#     · 足够小，真出问题时 15 秒内就能看见提示，不用等一分钟
+#
+# 【为什么是纯函数，不带 Path 参数】
+#   读文件的工作由 Read-PanelState 做（它已经有重试、共享读取等一堆讲究）。
+#   这里只接收"已经读到的结果"，纯粹做分类。职责分开才测得动。
+function Get-StaleHealthSeconds {
+    # 数据多久没更新算"可能不是最新"（秒）。用户拍板 15。
+    return 15
+}
+
+function Get-StateHealth {
+    param(
+        # 读到的原始文本（$null 表示没读到）
+        $Raw = $null,
+        # Read-PanelState 在读取阶段就已经知道的原因
+        # 可选值：ok / missing / readError / invalidJson
+        [string]$ErrorKind = 'ok',
+        # state.json 里的 updatedAt（秒）。0 或非正表示没有/读不到
+        [double]$UpdatedAtSec = 0,
+        # 当前时间，注入以便测试可重复
+        [datetime]$Now = [datetime]::Now,
+        # 解析出来的对象是否可用（JSON 合法且是对象）
+        [bool]$ObjectValid = $true
+    )
+
+    # ---- 先处理"读取阶段就失败"的三种：这些都不用看时间戳
+    if ($ErrorKind -eq 'missing') {
+        return [pscustomobject]@{
+            Kind = 'missing'; IsDegraded = $true; CanShowIdle = $false
+            AgeSec = -1; Message = '数据未更新'
+        }
+    }
+    if ($ErrorKind -eq 'readError') {
+        return [pscustomobject]@{
+            Kind = 'readError'; IsDegraded = $true; CanShowIdle = $false
+            AgeSec = -1; Message = '数据未更新'
+        }
+    }
+    if ($ErrorKind -eq 'invalidJson') {
+        return [pscustomobject]@{
+            Kind = 'invalidJson'; IsDegraded = $true; CanShowIdle = $false
+            AgeSec = -1; Message = '数据未更新'
+        }
+    }
+
+    # ---- 读到了，但内容不是可用对象
+    if (-not $ObjectValid) {
+        return [pscustomobject]@{
+            Kind = 'invalidJson'; IsDegraded = $true; CanShowIdle = $false
+            AgeSec = -1; Message = '数据未更新'
+        }
+    }
+
+    # ---- 时间戳不可用（0 / 负数 / NaN）
+    #
+    # 【为什么不判成 stale】
+    #   没有时间戳 = 不知道多久没更新。这时候说"过期了"是编的。
+    #   按本项目一贯原则：判断不了就不下结论，当作正常。
+    #   （老版本 state.json 可能真的没有 updatedAt —— 那时也不能误报。）
+    if (-not ($UpdatedAtSec -gt 0)) {
+        return [pscustomobject]@{
+            Kind = 'ok'; IsDegraded = $false; CanShowIdle = $true
+            AgeSec = -1; Message = ''
+        }
+    }
+
+    # ---- 算出数据年龄
+    $nowSec = [double][DateTimeOffset]::new($Now.ToUniversalTime()).ToUnixTimeSeconds()
+    $age = $nowSec - $UpdatedAtSec
+
+    # 【未来时间：时钟被改过或者插件用了错误的时间源】
+    #   不判陈旧（那不是数据的问题），但也不当成"新鲜"。
+    #   单独一个 timeAnomaly，不提示用户（提示了也帮不上忙）。
+    #   10 秒容忍：同一次读里 now 和 updatedAt 有亚秒级误差很正常。
+    if ($age -lt -10) {
+        return [pscustomobject]@{
+            Kind = 'timeAnomaly'; IsDegraded = $false; CanShowIdle = $true
+            AgeSec = $age; Message = ''
+        }
+    }
+
+    $threshold = Get-StaleHealthSeconds
+
+    # ---- 超过阈值 → 陈旧
+    if ($age -ge $threshold) {
+        return [pscustomobject]@{
+            Kind = 'stale'; IsDegraded = $true; CanShowIdle = $true
+            AgeSec = $age; Message = '数据未更新'
+        }
+    }
+
+    # ---- 一切正常
+    return [pscustomobject]@{
+        Kind = 'ok'; IsDegraded = $false; CanShowIdle = $true
+        AgeSec = $age; Message = ''
+    }
+}
 function Read-PanelState {
     param([string]$Path)
+    # 【v0.10.8 · C2】$empty 现在带健康信息。
+    #   注意：这个对象是"兜底空状态"，它必须标明"为什么空"。
+    #   原来它什么标记都不带，于是 Update-UI 无法区分
+    #   「DSH 真的没事做」和「拿不到数据」——两者都显示"空闲"。
     $empty = [pscustomobject]@{
         running = 0; approval = 0; todayTokens = [long]0
         lastFinished = $null; tasks = @(); approvals = @(); valley = $null
         subagentCount = 0
         approvalLast = $null
+        Health = (Get-StateHealth -ErrorKind 'missing' -Now ([datetime]::Now))
     }
-    if (-not (Test-Path $Path)) { return $empty }
+    if (-not (Test-Path $Path)) {
+        # 【v0.10.8 · C2】文件不存在：不能显示成"空闲"
+        return $empty
+    }
     try {
         $raw = Read-SharedText $Path
+        # 【v0.10.8 · C2】读失败（被锁/权限）和"文件为空"不是一回事。
+        #   Read-SharedText 读不到时返回 $null；真的空文件返回空串。
+        if ($null -eq $raw) {
+            return [pscustomobject]@{
+                running = 0; approval = 0; todayTokens = [long]0
+                lastFinished = $null; tasks = @(); approvals = @(); valley = $null
+                subagentCount = 0
+                approvalLast = $null
+                Health = (Get-StateHealth -ErrorKind 'readError' -Now ([datetime]::Now))
+            }
+        }
         if ([string]::IsNullOrWhiteSpace($raw)) { return $empty }
         $data = $raw | ConvertFrom-Json
     }
-    catch { return $empty }
+    catch {
+        # 【v0.10.8 · C2】JSON 坏了（写了一半 / 文件损坏）—— 不能当成"空闲"
+        return [pscustomobject]@{
+            running = 0; approval = 0; todayTokens = [long]0
+            lastFinished = $null; tasks = @(); approvals = @(); valley = $null
+            subagentCount = 0
+            approvalLast = $null
+            Health = (Get-StateHealth -ErrorKind 'invalidJson' -Now ([datetime]::Now))
+        }
+    }
 
     $running = 0; $tasks = @()
     # 正在跑的子代理数量（v0.6.0 插件新增的字段）。
@@ -1581,6 +1739,19 @@ function Read-PanelState {
     $tk = Get-Setting $data 'tokens' $null
     if ($null -ne $tk) { $tokens = [long](Get-Setting $tk 'today' 0) }
 
+    # 【v0.10.8 · C2】算健康状态。走到这里说明 JSON 已经解析成功。
+    #   拿 state.json 的 updatedAt（秒）判断"是不是太久没更新了"。
+    #   老 state.json 没有 updatedAt 时 UpdatedAtSec = 0，
+    #   Get-StateHealth 会当作"判断不了"→ 不误报（向后兼容）。
+    $updSec = 0
+    try {
+        $updRaw = Get-Setting $data 'updatedAt' 0
+        $updSec = [double]$updRaw
+    } catch { $updSec = 0 }
+
+    $health = Get-StateHealth -Raw $null -ErrorKind 'ok' -UpdatedAtSec $updSec `
+        -Now ([datetime]::Now) -ObjectValid $true
+
     return [pscustomobject]@{
         running = $running; approval = $approval; todayTokens = $tokens
         lastFinished = (Get-Setting $data 'lastFinished' $null)
@@ -1592,6 +1763,8 @@ function Read-PanelState {
         subagentCount = $subagentCount
         # v0.8.0 悬浮窗审批的回执（没有就是 $null，卡片不显示回执行）
         approvalLast = $approvalLast
+        # 【v0.10.8 · C2】健康信息。Update-UI 用它区分"真空闲"和"拿不到数据"。
+        Health = $health
     }
 }
 
@@ -3699,9 +3872,35 @@ function Update-BarTipContent {
     #   柱子本身就是"有活干"才出现的形态，写"正在运行"等于重复前提。
     #   但"待审批"和"已完成"是**和平时不一样**的状态 ——
     #   用户看到柱子变色了，需要知道为什么，所以这两种保留一句提示。
-    $showStatus = ($d.Phase -ne 'running') -and (-not [string]::IsNullOrEmpty([string]$d.StatusText))
+    # 【v0.10.8 · C2】健康提示优先级高于普通相位文案。
+    #
+    # 【为什么要有这一层】
+    #   原来只有"非 running 且有 StatusText"才显示状态行。
+    #   但"拿不到数据"这件事在 running 时同样可能发生
+    #   （插件卡住、文件坏了，而卡片还记着上次的 running 数字）。
+    #   这时候如果因为 Phase=running 就把状态行藏起来，
+    #   用户看到的就是"2 个任务运行中"——一个已经过期的假象。
+    #
+    #   missing / readError / invalidJson 三种属于"根本读不到"，
+    #   必须强行把状态行显示出来，文案用 HealthMsg（"数据未更新"）。
+    #
+    #   stale 不强行显示：数据是真的，只是旧了。柱态本来就是"专注模式"，
+    #   顶部多一行提示反而干扰。卡片那边已经用底部轻提示覆盖了。
+    $healthKind = ''
+    try { $healthKind = [string]$d.HealthKind } catch { $healthKind = '' }
+    $healthBroken = ($healthKind -eq 'missing') -or ($healthKind -eq 'readError') -or ($healthKind -eq 'invalidJson')
+
+    $statusText = [string]$d.StatusText
+    if ($healthBroken) {
+        $statusText = [string]$d.HealthMsg
+        if ([string]::IsNullOrWhiteSpace($statusText)) { $statusText = '数据未更新' }
+    }
+
+    $showStatus = ($d.Phase -ne 'running' -or $healthBroken) -and (-not [string]::IsNullOrEmpty($statusText))
     if ($showStatus) {
-        $p.Title.Text = [string]$d.StatusText
+        # 【v0.10.8 · C2】用上面算好的 $statusText ——
+        #   它可能是普通相位文案，也可能是健康提示（"数据未更新"）。
+        $p.Title.Text = $statusText
         $p.StatusRow.Visibility = 'Visible'
         $p.Sep1.Visibility = 'Visible'
         try {
@@ -5317,6 +5516,27 @@ function New-BarTipData {
         }
     } catch { Log-Fail 'L4991' $_ }
 
+    # 【v0.10.8 · C2】把健康信息带进气泡快照。
+    #
+    # 【为什么气泡也要有】
+    #   施工卡 C2-4 第 6 条要求三种形态（卡片 / 空闲小扁条 / 柱态气泡）
+    #   用同一份健康判断。如果只有卡片提示、气泡不提示，
+    #   用户缩成柱态后就看不到"数据拿不到"这件事了 ——
+    #   而柱态恰恰是他"专注干活、不看卡片"的时候，更需要这个提示。
+    #
+    # 【为什么不直接持有 $State.Health】
+    #   $script:barTipData 是一个**快照**，故意和 $State 解耦
+    #   （见上面那段长注释：柱态下每帧重建，不能持有外部对象引用）。
+    #   复制两个字段比持有整个 Health 对象更安全，也更好断言。
+    $healthKind = 'ok'
+    $healthMsg = ''
+    try {
+        if ($null -ne $State -and $null -ne $State.Health) {
+            $healthKind = [string]$State.Health.Kind
+            $healthMsg = [string]$State.Health.Message
+        }
+    } catch { $healthKind = 'ok'; $healthMsg = '' }
+
     return [pscustomobject]@{
         Phase      = $Phase
         StatusText = (Get-StatusTextForPhase -State $State -Phase $Phase)
@@ -5324,6 +5544,9 @@ function New-BarTipData {
         Overflow   = $overflow
         Today      = $today
         Valley     = $valleyText
+        # 【v0.10.8 · C2】健康快照
+        HealthKind = $healthKind
+        HealthMsg  = $healthMsg
     }
 }
 
@@ -5892,7 +6115,41 @@ function Update-UI {
         }
     }
 
+    # ================================================================ 【v0.10.8 · C2】健康提示覆盖
+    #
+    # 【为什么放在 switch 之后而不是融进去】
+    #   switch 里那套是"有活干时显示什么"，是**相位**逻辑。
+    #   健康是另一个维度：它可能发生在任何相位下（比如正在跑的时候数据停了）。
+    #   硬塞进 switch 会让两个维度互相纠缠，将来改动必然打架。
+    #
+    # 【覆盖规则：只在"拿不到数据"时覆盖标题】
+    #   missing / readError / invalidJson —— 这三种是"根本读不到"，
+    #   此时说什么"2 个任务运行中"都是编的，必须改成"数据未更新"。
+    #
+    #   stale —— 读到的是合法数据，只是旧了。
+    #   标题**不覆盖**（内容本身是真实的，只是老了），
+    #   而是在底部那行加一句轻提示。这样不会一过期就整个界面变脸。
+    #
+    #   ok / timeAnomaly —— 什么都不做。
+    $health = $null
+    try { $health = $State.Health } catch { $health = $null }
+
+    $healthKind = 'ok'
+    if ($null -ne $health) {
+        try { $healthKind = [string]$health.Kind } catch { $healthKind = 'ok' }
+    }
+
+    if ($healthKind -eq 'missing' -or $healthKind -eq 'readError' -or $healthKind -eq 'invalidJson') {
+        # 用 idle 相位配色（不抢眼、不冒充"出事了"），但文案明确说拿不到数据。
+        Set-Header '数据未更新' 'idle'
+    }
+
     Set-TaskList -State $State -Phase $phase
+
+    # ---- 陈旧时的轻提示：只在底部那行加，不动标题、不动布局
+    if ($healthKind -eq 'stale') {
+        $exp.FootLeft.Text = ('今日 {0} Token · 数据未更新' -f (Format-Tokens $State.todayTokens))
+    }
 
     # 收起态轮流显示 Token / 倒计时
     if ($script:mode -eq 'mini') {

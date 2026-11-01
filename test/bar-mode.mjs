@@ -1137,9 +1137,35 @@ group('7e. 柱态悬停气泡（v0.9.5）')
   //   但**待审批/已完成**是"和平时不一样"的状态，用户看到柱子变色需要知道为什么，
   //   所以保留成"按需显示"：只有非 running 才出现。
   check('【v0.9.8】状态提示行按需显示（running 时不占空间）',
-    /\$showStatus = \(\$d\.Phase -ne 'running'\)/.test(panelSrc))
+    /\$showStatus = \(\$d\.Phase -ne 'running'/.test(panelSrc))
   check('【v0.9.8】状态提示行有独立的 StatusRow 控件（不是复用标题）',
     /StatusRow\s*= \$statusRow/.test(visualSrc))
+
+  // ============================================================ v0.10.8 · C2：健康提示也走这一行
+  //
+  // 【为什么这条断言要和上面那条并存，而不是替换它】
+  //   v0.9.8 的规则"非 running 才显示状态行"**依然有效**，没有推翻。
+  //   C2 只是给它加了一个**例外**：数据根本拿不到时，即使 running 也要显示，
+  //   否则用户会看到一个已经过期的"2 个任务运行中"，那是假象。
+  //
+  //   【这不是"上一轮判断错了"】
+  //     v0.9.8 的取舍是"不要重复'正在运行'这个已知前提"。
+  //     C2 的取舍是"数据坏了必须说，哪怕当前记着 running"。
+  //     两者不矛盾：前提成立时才省略，前提不成立时必须说。
+  //
+  //   【为什么必须同时断言两件事】
+  //     只断言"能显示"会退化成"永远显示"（回到 v0.9.8 之前的样子）；
+  //     只断言"running 不显示"会让健康提示永远出不来。
+  //     所以一条守默认，一条守例外。
+  check('【v0.10.8·C2】数据拿不到时，running 也强制显示状态行',
+    /\$healthBroken/.test(panelSrc) &&
+    /\$showStatus = \(\$d\.Phase -ne 'running' -or \$healthBroken\)/.test(panelSrc),
+    '健康异常（missing/readError/invalidJson）必须绕过 running 判断')
+  check('【v0.10.8·C2】健康提示只在 three 种"读不到"时才强制，stale 不强制',
+    /\(\$healthKind -eq 'missing'\) -or \(\$healthKind -eq 'readError'\) -or \(\$healthKind -eq 'invalidJson'\)/.test(panelSrc),
+    'stale 是"数据旧了但真实"，柱态里不强行插入提示')
+  check('【v0.10.8·C2】气泡数据快照带 HealthKind / HealthMsg',
+    /HealthKind = \$healthKind/.test(panelSrc) && /HealthMsg\s*= \$healthMsg/.test(panelSrc))
 
   // 【修一个"两条规则打架"的 bug】
   //   Sep1 原来被两处控制：① 状态行那段 ② "有任务行才显示"那段。
