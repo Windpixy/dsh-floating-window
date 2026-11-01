@@ -87,10 +87,10 @@
 ### 方式一：命令行，从 npm 装（推荐）
 
 ```bash
-dsh plugin --profile <你的 profile> add dsh-floating-window@0.10.7
+dsh plugin --profile <你的 profile> add dsh-floating-window@0.10.11
 ```
 
-> ⚠️ **这条命令里的版本号必须写精确的**（`@0.10.7` 这种），不能只写包名。
+> ⚠️ **这条命令里的版本号必须写精确的**（`@0.10.11` 这种），不能只写包名。
 >
 > 原因：pnpm 11 有个「新版本等待期」机制（`minimumReleaseAge`，默认 **1440 分钟 = 1 天**）。  
 > 一个版本发布后不到这个时间，pnpm 会认为它"太新、还在观察期"而**不去装它**。  
@@ -121,7 +121,7 @@ dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 1. 打开 DSH，左侧栏点 **「插件」**
 2. 点 **「添加插件」**
 3. 在输入框里填下面任意一种：
-   - **包名**：`dsh-floating-window@0.10.7` ← 推荐
+   - **包名**：`dsh-floating-window@0.10.11` ← 推荐
    - **Git 地址**：`github:Windpixy/dsh-floating-window`
    - 打包好的压缩包路径
    - 本地文件夹的绝对路径（自己改了代码想试效果时用这个）
@@ -604,23 +604,32 @@ node test/writer-race.mjs       # 原子写盘竞争 7 项
 node test/plugin-wire.mjs       # 插件接线 21 项
 node test/revive-e2e.mjs        # 崩溃后自动恢复 10 项
 node test/approval-proxy.mjs    # 悬浮窗审批代理 85 项
-node test/bar-mode.mjs          # 柱态界面 336 项
+node test/bar-mode.mjs          # 柱态界面 339 项
 node test/freshness.mjs         # 旧代码检测 + 自动重启判据 24 项
 node test/logger.mjs            # 日志轮转与去重 91 项
 node test/staleness-chain.mjs   # 旧代码检测整链（含字段传递）20 项
+node test/restart-window.mjs    # 重启空窗检测 28 项
+node test/c4-async.mjs          # 情况不明复查不阻塞主线程 13 项
 ```
 
-合计 **939 项，全部不需要 DSH**。
+合计 **983 项，全部不需要 DSH**。
 
-> 上面的项数是写这份文档时实测的。**判断标准永远是「失败 0」，不是「正好 939」**——
+> 上面的项数是写这份文档时实测的。**判断标准永远是「失败 0」，不是「正好 983」**——
 > 每加一个功能这个总数就会变，别拿它当验收依据。
+
+**另外还有一个测量脚本**（不是断言测试，用来量化阻塞时长）：
+
+```bash
+node test/c4-blocking-measure.mjs
+# 输出各场景下主线程的停顿毫秒数，退出码 0 即正常
+```
 
 懒得一条条敲，可以一把跑完（PowerShell）：
 
 ```powershell
 foreach ($f in 'unit','tokens','launcher','valley','endpoint','writer-race',
                'plugin-wire','revive-e2e','approval-proxy','bar-mode',
-               'freshness','logger','staleness-chain') {
+               'freshness','logger','staleness-chain','restart-window','c4-async') {
   Write-Host "=== $f ===" -ForegroundColor Cyan
   node "test/$f.mjs"
 }
@@ -686,16 +695,22 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File test/m4-acceptance.ps1 
 | 八 | 打开 DSH 时先闪一张纯黑卡片 | 窗口首帧还没就绪就显示出来了 |
 | 九 | 卡片抓屏失败（两种不同形态） | 抓屏时机与重试逻辑，两种情况要分别处理 |
 | 十 | **自动"旧代码检测"失效**，改了代码不重启卡片 | 心跳里没带 `scriptStampMs` 字段，检测链路断了 |
+| 十一 | 状态读不到时卡片**显示成"空闲"**，用户以为没事 | 把"读取失败/文件损坏/数据陈旧/真空闲"四种情况混成了一种（v0.10.8 修） |
+| 十二 | 卡片自动更新重启时，有**约 13 秒什么都看不到** | 重启时序没安排好，旧窗口已关、新窗口未就绪（v0.10.9 修） |
+| 十三 | 情况不明时插件会**同步死等**复查结果，卡住 DSH 主线程 | 用 `Atomics.wait` 同步等待，最长阻塞 2259ms；改成异步后降到约 220ms（v0.10.10 修） |
 
-> 五～十 都是"卡片看起来还在、但功能不对"这类最难查的问题：
+> 五～十三 都是"卡片看起来还在、但功能不对"这类最难查的问题：
 > 没有报错，日志也正常，现象和"新功能写错了"一模一样。
-> 所以每次修完都补了针对性测试（`launcher` 从 32 项涨到 83 项，另外新增 `staleness-chain` 20 项）。
+>
+> 所以每次修完都补了针对性测试：
+> `launcher` 从 32 项涨到 83 项，另外新增 `staleness-chain` 20 项、
+> `restart-window` 28 项、`c4-async` 13 项，以及测量脚本 `c4-blocking-measure`。
 
 之后陆续补的**功能**：柱态（缩成细条）、悬浮窗审批、子代理状态显示、置顶、
 图形化设置界面、日志功能、深色壁纸自适应、代码更新自动重启、
 **任务行显示本次会话 Token**（v0.10.0）。
 
-本版本 **v0.10.7**。
+本版本 **v0.10.11**。
 
 ---
 
