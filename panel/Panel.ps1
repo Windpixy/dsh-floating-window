@@ -1623,7 +1623,15 @@ $app.Add_DispatcherUnhandledException({
     param($sender, $e)
     try {
         $ex = $e.Exception
-        Log-Card ('拦截到未捕获异常（卡片继续运行）: ' + $ex.GetType().Name + ' / ' + $ex.Message + ' @ ' + $ex.TargetSite)
+        # 【v0.10.5：级别从 INFO 改成 ERR，文案写清后果】
+        #   原来记的是 [INFO]「拦截到未捕获异常（卡片继续运行）」——
+        #   读起来像没事、已经被接住了，实际含义可能是
+        #   这条定时器从此永久停掉，对应功能已经死了。
+        #   2026-10-31 的白字 bug 就是这样潜伏的：功能已死，日志一片安静。
+        #   现在至少让人在按级别筛日志时能看见它。
+        Log-Card ('拦截到未捕获异常（应用未退出；但若发生在定时器回调里，该定时器可能已永久停止）: ' + 
+            $ex.GetType().Name + ' / ' + $ex.Message + ' @ ' + $ex.TargetSite) -Level 'ERR'
+
     } catch { Log-Fail 'L1540' $_ }
     $e.Handled = $true
 })
@@ -2260,6 +2268,10 @@ $script:backGfx = $null
 $script:backW = 0
 $script:backH = 0
 $script:lastSwitchAt = $null
+# 【v0.10.6】抓屏失败日志的去重时间戳（null = 还没记过）
+$script:captureFailLoggedAt = $null
+# 【v0.10.6b】自适应异常日志的去重时间戳（和上面那个分开，两类问题各记各的）
+$script:adaptiveExcLoggedAt = $null
 
 # 光晕初值必须和当前的 $script:curIsLight 对齐。
 #
@@ -2524,6 +2536,97 @@ function Update-AdaptiveText {
             }
         }
         if ($vals.Count -lt 20) { return }
+
+        # ================================================================
+        # 【v0.10.5 抓屏失败识别 —— 本次白字 bug 的另一个根因】
+        #
+        # 【要解决的问题】
+        #   Windows 上 CopyFromScreen 在下面这些情况下不会抛异常，
+        #   而是静默返回一片纯黑（已实测：三种越界坐标全部返回纯黑、
+        #   无异常、无 Win32 错误码）：
+        #     · 显示器关闭 / 熄屏 / 系统睡眠刚唤醒的那一瞬间
+        #     · 锁屏、UAC 安全桌面、RDP 断开
+        #     · 窗口坐标落在虚拟屏幕之外（换屏/改缩放/副屏掉线）
+        #
+        #   而"一片纯黑"喂进本函数的判据，会反解出"壁纸全黑"
+        #   → wallRel = 0.0000 < 0.186 → 必判白字。
+        #   这正是用户 2026-10-31 16:07 点亮屏幕后看到的：浅色页面上白字。
+        #
+        # 【为什么代码里的 try/catch 抓不住它】
+        #   因为它根本不抛异常，函数正常返回，只是内容全是黑的。
+        #
+        # 【判据为什么用"颜色种类数"而不是"亮度低"】
+        #   这是一个反直觉但很关键的点：
+        #   真实的深色壁纸本来就暗。如果用"亮度低"当失效判据，
+        #   会把正常的深色壁纸误判成"抓屏失败"，然后拒绝更新字色 ——
+        #   那深色壁纸下的白字就再也切不过去了。必须用结构特征，不能用亮度。
+        #
+        #   实测数据（本机 150% 缩放，采样带约 1792 个点）：
+        #     正常屏幕区域：不同颜色 16 ~ 536 种
+        #     抓屏失败(纯黑)：不同颜色 1 种
+        #   相差两三个数量级，非常好区分。
+        #
+        # 【成本】
+        #   零额外开销 —— 这些像素上面已经逐个 GetPixel 过了，
+        #   这里只是顺手统计一下颜色种类。
+        #
+        # 【失效时怎么做】
+        #   直接 return，本次不改任何颜色（保持上一次正确的结果）。
+        #   这比"用一片黑去算出一个白字结论"好得多：
+        #   最坏情况是"颜色晚 0.9 秒才更新"，而不是"永久停在错误颜色"。
+        # ================================================================
+        $distinctColours = New-Object 'System.Collections.Generic.HashSet[int]'
+        foreach ($v in $vals) {
+            [void]$distinctColours.Add((($v.R -shl 16) -bor ($v.G -shl 8) -bor $v.B))
+        }
+        $colourCount = $distinctColours.Count
+
+        if ($colourCount -le 2) {
+            # ================================================================
+            # 【v0.10.6：这条日志必须去重，否则会把日志淹掉】
+            #
+            # 【为什么 —— 2026-11-01 的真实教训】
+            #   v0.10.5 刚加上这个判据时，日志没做任何限流。
+            #   结果一夜（22:00~02:51）抓屏持续失败，写了 12600 条
+            #   一模一样的 CAPTURE-FAIL，panel-debug.log 涨到 1.5MB，
+            #   真正有价值的"句柄无效"错误全被埋在里面，翻起来极痛苦。
+            #
+            #   这个函数每 900ms 跑一次，一旦持续失败就是每小时 4000 条。
+            #   所以这里用和 Log-Card 一样的思路：**同类记录 60 秒只写一条**。
+            #
+            # 【为什么保留去重后还要写 panel.log】
+            #   panel-debug.log 是"只在开调试开关时才有"的临时日志。
+            #   抓屏失败是个**实质性的健康问题**，正常使用时也该留痕，
+            #   所以同时往 panel.log 记一条 WARN（Log-Card 自带 60 秒去重）。
+            # ================================================================
+            $firstPx = $vals[0]
+            $kind = '未知'
+            if ($firstPx.R -le 8 -and $firstPx.G -le 8 -and $firstPx.B -le 8) { $kind = '纯黑（多半是抓屏失败/熄屏唤醒）' }
+            elseif ($firstPx.R -ge 247 -and $firstPx.G -ge 247 -and $firstPx.B -ge 247) { $kind = '纯白' }
+
+            try {
+                Log-Card ('抓屏失败：采样带只有 ' + $colourCount + ' 种颜色（' + $kind + '），本轮保持原字色') `
+                    -Level 'WARN' -Key 'captureFail'
+            } catch { }
+
+            if ($script:debugOn) {
+                try {
+                    $nowTick = [datetime]::Now
+                    $lastTick = $script:captureFailLoggedAt
+                    $shouldLog = $true
+                    if ($null -ne $lastTick -and ($nowTick - $lastTick).TotalSeconds -lt 60) {
+                        $shouldLog = $false
+                    }
+                    if ($shouldLog) {
+                        $script:captureFailLoggedAt = $nowTick
+                        [System.IO.File]::AppendAllText($script:debugPath,
+                            ('{0} CAPTURE-FAIL colours={1} kind={2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'), $colourCount, $kind) + "`r`n",
+                            (New-Object System.Text.UTF8Encoding($false)))
+                    }
+                } catch { }
+            }
+            return
+        }
 
         # ================================================================
         # 【v0.9.13 加固：先剔除离群暗像素，再取中位数】
@@ -2913,14 +3016,63 @@ function Update-AdaptiveText {
         #   原来这里是空的 catch。后果：只要本函数里任何一步抛异常，
         #   就"一个颜色都不改、不报错、不写日志"，从外面完全看不出问题。
         #   这正是"判对了却没生效"这类 bug 能长期潜伏的原因。
-        #   现在至少留一条痕迹（只在调试开关下写，避免平时刷日志）。
-        if ($script:debugOn) {
+            #   现在至少留一条痕迹。
+            #
+            # 【v0.10.5：从"只在调试开关下写"改成"无条件写"】
+            #   为什么必须改：2026-10-31 那次白字事故，整个排查中最痛苦的一点是
+            #   功能实际上已经失效，但 panel.log 里一条异常都没有，
+            #   完全看不出"自适应已经死了"。因为原来的留痕被 $script:debugOn 挡住了。
+            #
+            #   带 -Key 做去重：同一个错误 60 秒内只记一条。
+            #   本函数每 900ms 跑一次，万一某处持续失败，
+            #   没有去重的话一天能写近 10 万行（项目历史踩过这个坑）。
+            # 【v0.10.6：抓屏异常要单独点名】
+        #   2026-10-31 那一夜，panel.log 里出现了 14 次
+        #     CopyFromScreen 时发生异常:"句柄无效。"
+        #   这个错误本来会被下面的 Log-Fail 记成一条泛泛的
+        #   "Update-AdaptiveText 失败"，排查时很难一眼认出
+        #   它其实是"抓屏拿不到画面"这一类问题。
+        #
+        #   单独点名之后，两个好处：
+        #     ① 按关键词搜 "抓屏异常" 就能统计发生频率
+        #     ② 和 "抓屏失败：采样带只有 N 种颜色" 是同一类病，
+        #        一个是抛异常、一个是静默返回坏数据，现在都归到同一个关键词下
+        $isCaptureError = $false
+        try {
+            $msgText = [string]$_.Exception.Message
+            if ($msgText -match '句柄无效|Handle is invalid|CopyFromScreen|invalid handle') {
+                $isCaptureError = $true
+            }
+        } catch { }
+
+        if ($isCaptureError) {
             try {
-                [System.IO.File]::AppendAllText($script:debugPath,
-                    ('{0} EXCEPTION {1}: {2}' -f (Get-Date -Format 'HH:mm:ss'),
-                     $_.Exception.GetType().Name, $_.Exception.Message) + "`r`n",
-                    (New-Object System.Text.UTF8Encoding($false)))
-            # 【故意静默】失败无害，下个周期会自动重试；记了会把日志刷爆
+                Log-Card ('抓屏异常（本轮不改字色，下一轮自动重试）：' + $_.Exception.Message) `
+                    -Level 'WARN' -Key 'captureError'
+            } catch { }
+        }
+
+        try { Log-Fail 'Update-AdaptiveText' $_ -Key 'adaptiveText' } catch { }
+
+        if ($script:debugOn) {
+            # ================================================================
+            # 【v0.10.6b：这条 debug 日志也必须去重】
+            #   隔离验证里实测：18 秒写了 14 条一模一样的 EXCEPTION。
+            #   这个函数每 900ms 跑一次，持续出错的话一天能写几十 MB，
+            #   把真正有用的信息全埋掉（昨晚 12600 条 CAPTURE-FAIL 就是这个下场）。
+            #   去重键单独用一个时间戳：抓屏失败和抛异常是两类问题，各记各的。
+            # ================================================================
+            try {
+                $nowExc = [datetime]::Now
+                $lastExc = $script:adaptiveExcLoggedAt
+                if ($null -eq $lastExc -or ($nowExc - $lastExc).TotalSeconds -ge 60) {
+                    $script:adaptiveExcLoggedAt = $nowExc
+                    [System.IO.File]::AppendAllText($script:debugPath,
+                        ('{0} EXCEPTION {1}: {2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'),
+                         $_.Exception.GetType().Name, $_.Exception.Message) + "`r`n",
+                        (New-Object System.Text.UTF8Encoding($false)))
+                }
+            # 【故意静默】失败无害，下个周期会自动重试
             } catch { }
         }
     }
@@ -6748,6 +6900,44 @@ try { $script:lastSettingsWrite = [System.IO.File]::GetLastWriteTimeUtc($Setting
 $glassWatch = New-Object System.Windows.Threading.DispatcherTimer
 $glassWatch.Interval = [TimeSpan]::FromMilliseconds(900)
 $glassWatch.Add_Tick({
+    # ================================================================
+    # 【v0.10.5 修 BUG：一次未捕获异常会让这条定时器永久停掉】
+    #
+    # 【用户报的现象】
+    #   2026-10-31 16:07，熄屏约 2 小时后点亮屏幕，卡片在浅色页面上
+    #   一直是白字，而且之后 50 多分钟完全不恢复。
+    #
+    # 【根因 —— 已用隔离副本实测复现，不是推理】
+    #   WPF 的 DispatcherTimer 有个硬规矩：回调里抛出未捕获异常之后，
+    #   这条定时器从此不再触发（不是"跳过这一轮"，是"整条报废"）。
+    #   实测对照（只让 Update-Glass 抛一次，之后永远正常）：
+    #     · 抛之前 ticks=1，抛之后 10 秒内 ticks 仍然是 1
+    #     · 同时 1 秒一次的心跳打了 13 次、一次没漏
+    #       → UI 线程没死，只死了这一条定时器
+    #
+    #   定时器一死，Update-AdaptiveText 再也不会被调用，
+    #   字色就永久停在最后一次写进去的值上 —— 界面看起来一切正常，
+    #   只有字色错。而全局兜底只记一行 INFO「卡片继续运行」，
+    #   日志里根本看不出"自适应已经死了"。
+    #
+    # 【为什么整段都要包，而不只是包 Update-Glass】
+    #   Update-Glass 自己内部是全包了 try/catch 的（3792→3830），它基本不外抛。
+    #   真正裸奔的是下面这几条：
+    #     $script:anchorLeft = [double]$win.Left      坐标异常时转换抛
+    #     $script:anchorTop  = [double]$win.Top       同上
+    #     New-Object PanelNative+RECT                 类型解析/内存异常
+    #     GetWindowRect($hwnd, ...)                   hwnd 失效时抛
+    #   所以包住整个函数体，而不是只包一句。
+    #
+    # 【为什么 catch 里绝不能再抛】
+    #   catch 里一旦再抛异常，等于没加这张网 —— 定时器照样报废。
+    #   所以 Log-Fail 外面再套一层静默 try。
+    #
+    # 【行为退化说明（可接受）】
+    #   万一某一轮出错，这一轮就什么都不改（可能少刷一次磨砂/少改一次字色），
+    #   下一轮 900ms 后照常继续。最坏情况是"晚 0.9 秒"，而不是"永久死掉"。
+    # ================================================================
+    try {
     Update-Glass
 
     # ===== v0.9.0：柱态要跳过下面全部 =====
@@ -6774,9 +6964,51 @@ $glassWatch.Add_Tick({
     }
 
     # 文字颜色跟着背后的真实亮度走（深色壁纸用浅字，浅色壁纸用深字）
+    #
+    # 【v0.10.5：hwnd 失效时要重新取，不能拿着死句柄每轮空转】
+    #   原来 $hwnd 只在一处用 EnsureHandle() 拿过一次，之后从不刷新。
+    #   窗口句柄在下面这些情况下会失效：
+    #     · 休眠/唤醒、DWM 重启、显示器拓扑变化（换屏/插拔/改缩放）
+    #     · 资源管理器重启
+    #   一旦失效，GetWindowRect 每轮都会失败或抛异常 ——
+    #   这正是上面那个"定时器永久停掉"最可疑的触发源。
+    #
+    #   这里做两件事：
+    #     ① GetWindowRect 失败 → 重新取一次 hwnd，下一轮就能恢复
+    #     ② 重新取也失败（窗口真没了）→ 本轮直接跳过，不做任何改色
+    #
+    #   注意：$hwnd 在本文件是全局变量，其它地方也在用，必须原地更新它。
     $rr = New-Object PanelNative+RECT
-    if ([PanelNative]::GetWindowRect($hwnd, [ref]$rr)) {
+    $gotRect = $false
+    try {
+        $gotRect = [PanelNative]::GetWindowRect($hwnd, [ref]$rr)
+    } catch {
+        $gotRect = $false
+    }
+    if (-not $gotRect) {
+        try {
+            $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($win)).Handle
+            if ($hwnd -ne [IntPtr]::Zero) {
+                $rr = New-Object PanelNative+RECT
+                $gotRect = [PanelNative]::GetWindowRect($hwnd, [ref]$rr)
+            }
+        } catch {
+            $gotRect = $false
+        }
+    }
+    if ($gotRect) {
         Update-AdaptiveText -X $rr.Left -Y $rr.Top -W ($rr.Right - $rr.Left) -H ($rr.Bottom - $rr.Top)
+    }
+    } catch {
+        # ================================================================
+        # 【v0.10.5：这里绝对不能往外抛】
+        #   WPF 的 DispatcherTimer 只要看到一次未捕获异常，这条定时器就永久停掉。
+        #   所以 catch 里连写日志都要再套一层 try —— 日志系统自己也可能出问题。
+        #
+        #   带 -Key 做去重：同一类错误 60 秒内只记一条，
+        #   避免某个持续失败的点把 panel.log 刷爆（项目历史踩过这个坑）。
+        # ================================================================
+        try { Log-Fail 'glassWatch-tick' $_ -Key 'glassWatchTick' } catch { }
     }
 })
 $glassWatch.Start()
