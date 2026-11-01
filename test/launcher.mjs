@@ -64,6 +64,69 @@ test('心跳过期 -> 没在跑', () => {
   assert.match(r.reason, /过期/)
 })
 
+// ================================================================ C1：字段传递（v0.10.7）
+//
+// 【这组测试守的是什么 —— 一个从 v0.9.12 起就存在的静默断链】
+//
+//   卡片每 2 秒写心跳，里面带 scriptStampMs（"我这个进程启动时，
+//   磁盘上 Panel.ps1 是什么时间戳"）。这是"卡片有没有跑旧代码"的**唯一依据**。
+//
+//   ┌─ Panel.ps1:162-179      写 heartbeat.json，含 scriptStampMs
+//   ├─ checkHeartbeat()       读出来、判断活着 → 但**没把 scriptStampMs 传出去**
+//   ├─ index.js:650           judgeCardStaleness(hb, { diskStampMs })
+//   └─ launcher.js:1001       hb.scriptStampMs 是 undefined → 返回 no-loaded-stamp
+//
+//   后果：自动检测**永远**说"无法判断"，卡片永远不会自动更新。
+//   而手工脚本 test/check-card-staleness.mjs 直接读 JSON，所以它能看到旧代码：
+//   2026-11-01 实测手工报"落后 1109 分钟"，自动检测却一声不吭。
+//
+//   【为什么单测没抓到】
+//     原 test/freshness.mjs 是给 judgeCardStaleness 手填一个"理想对象"，
+//     从来没有走过"真实 JSON → checkHeartbeat → judge"这条完整链路。
+//     下面这几条就是为了堵住这个缝隙。
+group('C1 字段传递：scriptStampMs 必须原样传出去')
+
+test('新鲜心跳要把 scriptStampMs 原样带出来', () => {
+  const d = freshDir()
+  const stamp = NOW - 500000
+  writeHb(d, {
+    pid: 1234, hwnd: 99, alive: true, updatedAtMs: NOW - 1000, scriptStampMs: stamp,
+  })
+  const r = checkHeartbeat(d, { now: () => NOW })
+  assert.equal(r.alive, true)
+  assert.equal(r.scriptStampMs, stamp, 'scriptStampMs 被吞了 → 自动旧代码检测会永远失效')
+})
+
+test('scriptStampMs 是数字字符串时也要能传出来（PowerShell 可能写字面量）', () => {
+  const d = freshDir()
+  const stamp = NOW - 500000
+  writeHb(d, { pid: 1, alive: true, updatedAtMs: NOW - 1000, scriptStampMs: String(stamp) })
+  const r = checkHeartbeat(d, { now: () => NOW })
+  assert.equal(r.alive, true)
+  assert.equal(r.scriptStampMs, stamp, '字符串时间戳应被转成数字，不是原样丢弃')
+})
+
+test('老卡片没有 scriptStampMs -> 保持 undefined，不伪造 0', () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1, alive: true, updatedAtMs: NOW - 1000 })
+  const r = checkHeartbeat(d, { now: () => NOW })
+  assert.equal(r.alive, true)
+  // 【关键】必须是 undefined，不能是 0 / NaN。
+  //   因为 judgeCardStaleness 用 "Number.isFinite(loadedStampMs) && > 0"
+  //   判"有没有这个字段"。若这里伪造成 0，会被当成"有字段但值非法"，
+  //   虽然结论一样是不杀，但语义错了，将来加日志会误导。
+  assert.equal(r.scriptStampMs, undefined, '没有这个字段就该是 undefined')
+})
+
+test('scriptStampMs 是垃圾值 -> 原样传出，由判断函数兜底（不在这一层吞掉）', () => {
+  const d = freshDir()
+  writeHb(d, { pid: 1, alive: true, updatedAtMs: NOW - 1000, scriptStampMs: 'garbage' })
+  const r = checkHeartbeat(d, { now: () => NOW })
+  assert.equal(r.alive, true)
+  // 传 NaN 出来，judgeCardStaleness 里 Number.isFinite(NaN)===false 会挡住
+  assert.ok(Number.isNaN(r.scriptStampMs), '垃圾值应变成 NaN 交给下游判断，而不是就地消失')
+})
+
 // ---------------------------------------------------------------- 崩溃识别
 //
 // 【为什么必须有这一组】
