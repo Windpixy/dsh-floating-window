@@ -4275,11 +4275,93 @@ function Clamp-Position {
     if ($win.Top -lt $w.Top) { $win.Top = $w.Top + 4 }
 }
 
+# ---------------------------------------------------------------- 原子写文件（v0.10.13 · D1）
+#
+# 【这个函数解决什么】
+#   原来 Panel.ps1 里写 JSON 用的是：
+#       [System.IO.File]::WriteAllText($path, $json, ...)
+#   直接覆盖正式文件。写到一半崩溃/断电 → 留下半截坏 JSON。
+#
+#   panel-pos.json 坏了 → 卡片位置丢失，回到默认位置（用户会觉得"卡片乱跑"）。
+#   settings.json 坏了（写置顶时）→ 整个外观设置全丢。
+#
+# 【怎么改】
+#   写到一个**独一无二**的临时文件，再替换正式文件。
+#   临时名带 PID，两个进程同时写也不会撞（原来 PowerShell 这边没有共用名问题，
+#   但同一进程内如果并发调用仍可能撞，加 PID + 随机串更稳）。
+#
+# 【Windows 上的替换细节】
+#   [System.IO.File]::Move($tmp, $dst, $true) —— 三参数的 Move（带 overwrite）
+#   **PowerShell 5.1 / .NET Framework 不支持**，会抛异常。
+#   （项目里已有踩坑记录：bar-mode.mjs 专门有一条断言守这个）
+#
+#   所以这里用两步：
+#     ① 优先试 [System.IO.File]::Replace（原子替换，但要求目标存在）
+#     ② 目标不存在 或 Replace 失败 → 退化为 Move 覆盖
+#
+#   Replace 是 .NET 提供的原子替换 API，比"先删再移"安全得多：
+#   它在替换成功之前不会让目标消失。
+function Write-FileAtomic {
+    param(
+        [string]$Path,
+        [string]$Text,
+        [System.Text.Encoding]$Encoding = $null
+    )
+
+    if ($null -eq $Encoding) {
+        # JSON 绝不能带 BOM（DSH 读 package.json 时踩过这个坑）
+        $Encoding = New-Object System.Text.UTF8Encoding($false)
+    }
+
+    $tmp = $null
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) {
+            [void](New-Item -ItemType Directory -Path $dir -Force)
+        }
+
+        # 唯一临时名：正式名 + pid + 随机串
+        $rnd = [System.Guid]::NewGuid().ToString('N').Substring(0, 8)
+        $tmp = $Path + '.' + $PID + '.' + $rnd + '.tmp'
+
+        [System.IO.File]::WriteAllText($tmp, $Text, $Encoding)
+
+        # ① 目标存在时，优先用 Replace（原子）
+        if (Test-Path $Path) {
+            try {
+                # 第二个参数是备份文件；传 $null 表示不保留备份
+                [System.IO.File]::Replace($tmp, $Path, $null)
+                return $true
+            }
+            catch {
+                # Replace 在某些文件系统/被杀软占用时会失败，落到下面
+            }
+            # ② 退化：删除 + 移动（有极短窗口，见文件头说明）
+            try { [System.IO.File]::Delete($Path) } catch { }
+        }
+
+        [System.IO.File]::Move($tmp, $Path)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        # 无论成功失败都清理临时文件（Move/Replace 成功后 tmp 已不存在）
+        if ($null -ne $tmp -and (Test-Path $tmp)) {
+            try { [System.IO.File]::Delete($tmp) } catch { }
+        }
+    }
+}
 function Save-Position {
     try {
         $o = [ordered]@{ left = [double]$win.Left; top = [double]$win.Top }
         $json = $o | ConvertTo-Json
-        [System.IO.File]::WriteAllText($PosPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        # 【v0.10.13 · D1】改用原子写：写到唯一临时文件再替换。
+        #   原来直接 WriteAllText 覆盖，写一半崩了会留下坏 JSON，
+        #   下次启动读不到位置 → 卡片回到默认位置（用户觉得"卡片乱跑"）。
+        #   写失败时正式文件保持原样，最差只是"这次位置没记住"，不会毁掉旧记录。
+        [void](Write-FileAtomic -Path $PosPath -Text $json)
     } catch { Log-Fail 'L3757' $_ }
 }
 

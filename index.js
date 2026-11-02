@@ -30,6 +30,7 @@ import {
 } from './lib/endpoint.js'
 import { readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { writeJsonAtomic } from './lib/json-store.js'
 
 // ================================================================ 版本号
 //
@@ -77,14 +78,23 @@ function readSettingsFile(path) {
 
 /** 原子写 settings.json（写 tmp 再改名，卡片不会读到半截） */
 function writeSettingsFile(path, obj) {
-  try {
-    const tmp = path + '.tmp'
-    writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8')
-    renameSync(tmp, path)
-    return true
-  } catch {
-    return false
-  }
+  // ================================================================
+  // 【v0.10.13 · D1】改用统一的原子写入
+  //
+  // 【改造前】
+  //     const tmp = path + '.tmp'
+  //     writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8')
+  //     renameSync(tmp, path)
+  //
+  // 已经是"临时文件 + 改名"了，方向对。但临时名固定为 `settings.json.tmp`，
+  // 而 settings.json 恰好是**三个写者**都会动的文件
+  // （插件同步 dshUrl、卡片写置顶、设置窗口保存外观）。
+  // 两个写者同时动手时共用同一个 tmp 名 → 互相覆盖中间结果，
+  // 最终文件内容可能来自"半次 A + 半次 B"，而且**全程不报错**。
+  //
+  // 现在交给 writeJsonAtomic：临时名带 pid + 随机串，不可能撞。
+  // ================================================================
+  return writeJsonAtomic(path, obj)
 }
 
 export const name = 'dsh-floating-window'
