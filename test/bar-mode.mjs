@@ -1583,10 +1583,47 @@ group('7e-3. 置顶开关（v0.9.14）')
   //     settings.json 是卡片和设置窗口共用的。
   //     如果直接写一份只有 topmost 的 JSON，用户改过的磨砂浓度、卡片宽度、
   //     审批开关……会**全部被抹掉**。这是数据丢失级别的 bug。
+  //
+  //   【v0.10.14 · D1 第二步：断言跟着实现走，但守的东西没变】
+  //
+  //     实现从「本函数内自己 foreach 旧键 + 固定 tmp 名 + Move」
+  //     改成了「调用 Write-JsonWithLock（抢锁 → 锁内重读 → 合并 → 原子写）」。
+  //
+  //     这不是"上一轮判断错了"：
+  //       v0.9.14 的验收点是"保留其他键 + 原子写"，依然有效；
+  //       D1 只是把实现升级成**跨进程安全**，并且把"读全量再改"的
+  //       职责搬进了更底层的 Write-JsonWithLock。
+  //
+  //     所以断言要换成检查"新实现是否仍然满足老要求"：
+  //       ① 保存走带锁的读-改-写（它会锁内重读并保留所有已有键）
+  //       ② 写入是原子的（走 Write-FileAtomic）
   check('【v0.9.14 关键】保存置顶时保留其他键（不会抹掉用户的其他设置）',
+    // 新实现：Save-TopmostSetting 调 Write-JsonWithLock，
+    // 后者在锁内重读并把**所有已有键**先装进 $cur（见下面的 PSObject.Properties 遍历）
+    (/function Save-TopmostSetting[\s\S]{0,1500}Write-JsonWithLock/.test(codeOnly) &&
+      /function Write-JsonWithLock[\s\S]{0,2500}foreach \(\$p in \$obj\.PSObject\.Properties\)/.test(codeOnly)) ||
+    // 兼容老实现（万一回退）
     /function Save-TopmostSetting[\s\S]{0,900}foreach \(\$p in \$cur\.PSObject\.Properties\)/.test(codeOnly))
-  check('【v0.9.14 关键】保存置顶用原子写（tmp + Move，避免卡片读到半截）',
+
+  check('【v0.9.14 关键】保存置顶走原子写（避免卡片读到半截）',
+    // 新实现：Write-JsonWithLock 内部调 Write-FileAtomic（临时文件 + 原子替换）
+    (/function Write-JsonWithLock[\s\S]{0,3000}Write-FileAtomic/.test(codeOnly) &&
+      /function Write-FileAtomic[\s\S]{0,3000}File\]::Replace/.test(codeOnly)) ||
+    // 兼容老实现
     /function Save-TopmostSetting[\s\S]{0,1600}\$tmp = "\$SettingsPath\.tmp"[\s\S]{0,600}Move\(\$tmp, \$SettingsPath\)/.test(codeOnly))
+
+  // ---- ⑦b 【v0.10.14 · D1 第二步新增】保存置顶必须加跨进程锁
+  //
+  //   【为什么单独一条】
+  //     "保留其他键 + 原子写"解决的是**单进程**的问题。
+  //     但设置窗口是另一个进程，也会写 settings.json。
+  //     两个进程同时保存时，后写的会覆盖先写的 ——
+  //     原子写防不住这个，必须靠锁。
+  check('【v0.10.14·D1】保存置顶走跨进程锁',
+    /function Save-TopmostSetting[\s\S]{0,1500}Write-JsonWithLock/.test(codeOnly) &&
+    /function Enter-FileLock/.test(codeOnly))
+  check('【v0.10.14·D1】设置窗口也有同一套锁（两处必须一致）',
+    /function Enter-FileLock/.test(readFileSync(join(panelDir, 'Settings.ps1'), 'utf8')))
 
   // ---- ⑧ 【这条是实测抓出来的真 bug】
   //

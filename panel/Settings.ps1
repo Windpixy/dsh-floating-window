@@ -659,6 +659,137 @@ function Get-DshUrlReadout {
 # 【PS 5.1 注意】
 #   PS 5.1 没有 [IO.File]::Move(a, b, $true) 三参数重载，会抛"找不到 Move 的重载"。
 #   用 Move-Item -Force（卡片心跳也是这么写的，已在真机跑很久）。
+# ---------------------------------------------------------------- 跨进程写锁（v0.10.14 · D1 第二步）
+#
+# 【为什么需要 —— 和 Panel.ps1 里那份是同一件事】
+#   本文件（设置窗口）和卡片（Panel.ps1）是**两个独立进程**，
+#   都会写 settings.json，而且都用固定名 `<settings.json>.tmp`。
+#   两个同时保存时，后写的会覆盖前一个的临时文件 ——
+#   最终内容可能来自"半次卡片 + 半次设置窗口"，而且不报错。
+#
+# 【为什么两处各写一份，不共享】
+#   Panel.ps1 和 Settings.ps1 是两个独立进程、各自被 dot-source，
+#   没有共享模块机制。抽到单独文件需要改 package.json 的 files 白名单，
+#   并且两个进程都要能找到那个文件 —— 与"两个进程各自独立"的现有设计冲突。
+#   所以接受少量逻辑重复，换取不改打包结构和加载路径。
+#
+#   ⚠️ 两处逻辑必须保持一致。改一处必须同步改另一处。
+
+$script:LockTimeoutMs = 2000
+$script:LockStaleMs = 10000
+$script:LockPollMs = 50
+
+function Get-LockPath {
+    param([string]$Path)
+    return $Path + '.lock'
+}
+
+function Read-LockInfo {
+    param([string]$LockPath)
+    try {
+        $txt = [System.IO.File]::ReadAllText($LockPath)
+        if ([string]::IsNullOrWhiteSpace($txt)) { return $null }
+        return ($txt | ConvertFrom-Json)
+    } catch { return $null }
+}
+
+function Test-LockStale {
+    param([string]$LockPath)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $info = Read-LockInfo -LockPath $LockPath
+
+    if ($null -ne $info -and $null -ne $info.at) {
+        try {
+            $age = $now - [double]$info.at
+            if ($age -ge $script:LockStaleMs) {
+                return [pscustomobject]@{ Stale = $true; Reason = ('锁已存在 {0} 秒' -f [math]::Round($age / 1000)) }
+            }
+            return [pscustomobject]@{ Stale = $false; Reason = ('锁还很新（{0} 秒）' -f [math]::Round($age / 1000)) }
+        } catch { }
+    }
+
+    try {
+        $mtime = [System.IO.File]::GetLastWriteTimeUtc($LockPath)
+        $age = ([DateTime]::UtcNow - $mtime).TotalMilliseconds
+        if ($age -ge $script:LockStaleMs) {
+            return [pscustomobject]@{ Stale = $true; Reason = ('锁文件 mtime 已是 {0} 秒前' -f [math]::Round($age / 1000)) }
+        }
+        return [pscustomobject]@{ Stale = $false; Reason = ('锁文件 mtime 还新（{0} 秒）' -f [math]::Round($age / 1000)) }
+    } catch {
+        return [pscustomobject]@{ Stale = $true; Reason = '锁文件读不到' }
+    }
+}
+
+function Try-AcquireLockOnce {
+    param([string]$Path)
+    $lockPath = Get-LockPath -Path $Path
+    $nonce = [System.Guid]::NewGuid().ToString('N')
+    $info = [ordered]@{
+        pid = $PID
+        at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        nonce = $nonce
+        target = [System.IO.Path]::GetFileName($Path)
+    }
+
+    try {
+        $fs = [System.IO.File]::Open($lockPath,
+            [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes(($info | ConvertTo-Json -Compress))
+            $fs.Write($jsonBytes, 0, $jsonBytes.Length)
+            $fs.Flush()
+        } finally { $fs.Dispose() }
+        return [pscustomobject]@{ Ok = $true; LockPath = $lockPath; Nonce = $nonce; Reason = '获取成功' }
+    }
+    catch {
+        if (Test-Path $lockPath) {
+            $st = Test-LockStale -LockPath $lockPath
+            if ($st.Stale) {
+                try { [System.IO.File]::Delete($lockPath) } catch { }
+                try {
+                    $fs2 = [System.IO.File]::Open($lockPath,
+                        [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                    try {
+                        $jsonBytes2 = [System.Text.Encoding]::UTF8.GetBytes(($info | ConvertTo-Json -Compress))
+                        $fs2.Write($jsonBytes2, 0, $jsonBytes2.Length)
+                        $fs2.Flush()
+                    } finally { $fs2.Dispose() }
+                    return [pscustomobject]@{ Ok = $true; LockPath = $lockPath; Nonce = $nonce; Reason = ('接管过期锁：' + $st.Reason) }
+                }
+                catch { return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = '接管时被抢先' } }
+            }
+            return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = ('被占用：' + $st.Reason) }
+        }
+        return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = ('创建锁失败: ' + $_.Exception.Message) }
+    }
+}
+
+function Enter-FileLock {
+    param([string]$Path, [int]$TimeoutMs = 0)
+    if ($TimeoutMs -le 0) { $TimeoutMs = $script:LockTimeoutMs }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $r = Try-AcquireLockOnce -Path $Path
+        if ($r.Ok) { return [pscustomobject]@{ LockPath = $r.LockPath; Nonce = $r.Nonce; Reason = $r.Reason; Failed = $false } }
+        if ($sw.ElapsedMilliseconds -ge $TimeoutMs) {
+            return [pscustomobject]@{ LockPath = ''; Nonce = ''; Reason = $r.Reason; Failed = $true }
+        }
+        [System.Threading.Thread]::Sleep([int]$script:LockPollMs)
+    }
+}
+
+function Exit-FileLock {
+    param($Lock)
+    if ($null -eq $Lock -or [string]::IsNullOrEmpty($Lock.LockPath)) { return $false }
+    try {
+        $cur = Read-LockInfo -LockPath $Lock.LockPath
+        if ($null -ne $cur -and $cur.nonce -eq $Lock.Nonce) {
+            [System.IO.File]::Delete($Lock.LockPath)
+            return $true
+        }
+        return $false
+    } catch { return $false }
+}
 function Save-Settings {
     param(
         [string]$Path,
@@ -703,26 +834,111 @@ function Save-Settings {
         $payload['approvalConfirm'] = [bool]$Values.approvalConfirm
     }
 
-    # ---- 4. 原子写：写 tmp 再改名
-    $json = $payload | ConvertTo-Json -Depth 8
-    $tmp = "$Path.tmp"
-    # 关键：UTF8Encoding($false) —— 绝不能带 BOM。
-    # settings.json 带 BOM 会让 node 的 JSON.parse 直接抛错（第四轮事故）。
-    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
-
+    # ---- 4. 带跨进程锁的原子写（v0.10.14 · D1 第二步）
+    #
+    # 【改造前的问题】
+    #   原来用固定名 `$Path.tmp`（即 settings.json.tmp），
+    #   而卡片 Panel.ps1 的 Save-TopmostSetting 也用**同一个** tmp 名。
+    #   两个独立进程同时保存 → 共用 tmp → 互相覆盖中间结果，
+    #   最终文件可能是"半次卡片 + 半次设置窗口"，而且不报错。
+    #
+    #   另外，原来的流程是"先在锁外读一遍文件 → 改 → 写"。
+    #   如果读完之后、写之前卡片改了 topmost，这次保存会把它覆盖掉。
+    #
+    # 【现在】
+    #   抢锁 → **锁内重读最新内容** → 用本界面负责的键覆盖 → 原子写 → 放锁。
+    #   锁内重读保证了"拿锁前别人改过的键不会被这次写抹掉"。
+    #
+    # 【注意 payload 的构建必须在锁内】
+    #   所以下面把"读旧键 + 改本界面键"整段挪进锁内执行。
+    $json = $null
+    $lock = $null
     try {
-        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+        $lock = Enter-FileLock -Path $Path
+        if ($null -eq $lock -or $lock.Failed) {
+            $why = if ($null -ne $lock) { $lock.Reason } else { '未知' }
+            Write-SettingsLog ('保存设置失败：抢锁失败（' + $why + '），本次未写入') -Level 'WARN'
+            return
+        }
+
+        # ---- 锁内重读（关键）
+        $fresh = [ordered]@{}
+        if (Test-Path $Path) {
+            try {
+                $rawNow = [System.IO.File]::ReadAllText($Path)
+                if (-not [string]::IsNullOrWhiteSpace($rawNow)) {
+                    $objNow = $rawNow | ConvertFrom-Json
+                    if ($null -ne $objNow) {
+                        foreach ($pp2 in $objNow.PSObject.Properties) { $fresh[$pp2.Name] = $pp2.Value }
+                    }
+                }
+            }
+            catch {
+                Write-SettingsLog ('锁内重读失败，将基于空对象写（原内容可能已损坏）: ' + $_.Exception.Message) -Level 'WARN'
+            }
+        }
+
+        # ---- 用锁内读到的最新内容做基准，重放下面所有改动
+        #
+        # 【为什么可以直接替换 $payload】
+        #   上面第 1~3 步已经在 $payload 里算好了"要写的完整内容"，
+        #   但那份基于**锁外**读到的 $Current。
+        #   现在拿锁内的 $fresh 重新走一遍同样的合并规则：
+        #     ① 保留 $fresh 里所有键（含不认识的）
+        #     ② 删掉已废弃的键
+        #     ③ 覆盖本界面负责的键
+        $payload2 = [ordered]@{}
+        foreach ($k2 in $fresh.Keys) { $payload2[$k2] = $fresh[$k2] }
+        $payload2.Remove('valley')
+        $payload2.Remove('cardHeight')
+        $payload2['alternateSeconds'] = [int]$Values.alternateSeconds
+        $payload2['cardWidth']        = [int]$Values.cardWidth
+        $payload2['miniHeight']       = [int]$Values.miniHeight
+        $payload2['glassOpacity']     = [int]$Values.glassOpacity
+        $payload2['snapToEdge']       = [bool]$Values.snapToEdge
+        $payload2['edgeMargin']       = [int]$Values.edgeMargin
+        $payload2['clickOpensDsh']    = [bool]$Values.clickOpensDsh
+        if ($Values.ContainsKey('approvalInline')) {
+            $payload2['approvalInline'] = [bool]$Values.approvalInline
+        }
+        if ($Values.ContainsKey('approvalConfirm')) {
+            $payload2['approvalConfirm'] = [bool]$Values.approvalConfirm
+        }
+
+        $json = $payload2 | ConvertTo-Json -Depth 8
+
+        # ---- 原子写（唯一临时名 + File.Replace）
+        # 关键：UTF8Encoding($false) —— 绝不能带 BOM。
+        # settings.json 带 BOM 会让 node 的 JSON.parse 直接抛错（第四轮事故）。
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        $tmp = $Path + '.' + $PID + '.' + ([System.Guid]::NewGuid().ToString('N').Substring(0, 8)) + '.tmp'
+        try {
+            [System.IO.File]::WriteAllText($tmp, $json, $enc)
+
+            $replaced = $false
+            if (Test-Path $Path) {
+                try {
+                    [System.IO.File]::Replace($tmp, $Path, $null)
+                    $replaced = $true
+                }
+                catch {
+                    # Replace 可能被杀软/文件系统挡住，退化为删除+移动
+                }
+            }
+            if (-not $replaced) {
+                if (Test-Path $Path) { try { [System.IO.File]::Delete($Path) } catch { } }
+                [System.IO.File]::Move($tmp, $Path)
+            }
+        }
+        finally {
+            if (Test-Path $tmp) { try { [System.IO.File]::Delete($tmp) } catch { } }
+        }
     }
     catch {
-        # 极少数情况下改名会被占用挡一下，退化为"复制 + 删"，仍然不会写到半个文件
-        Copy-Item -LiteralPath $tmp -Destination $Path -Force
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        # 【A 档：必须记，但用 WARN 不用 ERR】
-        #   走到这里说明已经降级：结果仍然是对的，但"复制"不是原子操作 ——
-        #   卡片每 500ms 读一次 settings.json，极小概率读到半截（B3 那个坑正是这个）。
-        #   而且它出现本身就说明有别的进程正占着 settings.json，
-        #   这往往就是"我保存了但卡片没反应"的现场证据。
-        Write-SettingsLog ('改名保存失败，已退化为复制+删除（非原子，可能被读到半截）: ' + $_.Exception.Message) -Level 'WARN'
+        Write-SettingsLog ('保存设置异常：' + $_.Exception.Message) -Level 'ERR'
+    }
+    finally {
+        if ($null -ne $lock) { [void](Exit-FileLock -Lock $lock) }
     }
 }
 

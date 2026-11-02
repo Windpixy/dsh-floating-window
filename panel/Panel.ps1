@@ -4301,6 +4301,275 @@ function Clamp-Position {
 #
 #   Replace 是 .NET 提供的原子替换 API，比"先删再移"安全得多：
 #   它在替换成功之前不会让目标消失。
+# ---------------------------------------------------------------- 跨进程写锁（v0.10.14 · D1 第二步）
+#
+# 【为什么需要】
+#   卡片（本文件）和设置窗口（Settings.ps1）是**两个独立进程**，
+#   都会写 settings.json，而且**都用固定的 `settings.json.tmp`**。
+#   两个同时保存时，后写的会覆盖前一个的临时文件 ——
+#   最终内容可能来自"半次卡片 + 半次设置窗口"，而且不报错。
+#
+# 【怎么保证互斥】
+#   用 ".lock" 文件 + FileMode::CreateNew（O_CREAT | O_EXCL 语义）：
+#   文件已存在就抛异常，两个进程不可能同时创建成功。
+#
+# 【怎么防死锁】
+#   持锁进程被强杀时锁文件会留在磁盘上。所以：
+#     · 锁文件里记 pid / 时间 / nonce
+#     · 超过 $LockStaleMs（10 秒）没更新 → 认为持有者已死，可以接管
+#     · 抢锁总超时 $LockTimeoutMs（2 秒）→ 抢不到就放弃，不无限等
+#
+# 【为什么能接管"坏锁文件"】
+#   如果内容读不出来，退回用文件 mtime 判断。任一证据显示够旧就接管，
+#   否则可能永久卡死（比"偶尔多写一次"严重得多）。
+
+$script:LockTimeoutMs = 2000
+$script:LockStaleMs = 10000
+$script:LockPollMs = 50
+
+function Get-LockPath {
+    param([string]$Path)
+    return $Path + '.lock'
+}
+
+function Read-LockInfo {
+    param([string]$LockPath)
+    try {
+        $txt = [System.IO.File]::ReadAllText($LockPath)
+        if ([string]::IsNullOrWhiteSpace($txt)) { return $null }
+        $j = $txt | ConvertFrom-Json
+        if ($null -eq $j) { return $null }
+        return $j
+    } catch {
+        return $null
+    }
+}
+
+function Test-LockStale {
+    param([string]$LockPath)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $info = Read-LockInfo -LockPath $LockPath
+
+    if ($null -ne $info -and $null -ne $info.at) {
+        try {
+            $age = $now - [double]$info.at
+            if ($age -ge $script:LockStaleMs) {
+                return [pscustomobject]@{ Stale = $true; Reason = ('锁已存在 {0} 秒' -f [math]::Round($age / 1000)) }
+            }
+            return [pscustomobject]@{ Stale = $false; Reason = ('锁还很新（{0} 秒）' -f [math]::Round($age / 1000)) }
+        } catch { }
+    }
+
+    # 内容坏了 → 退回 mtime
+    try {
+        $mtime = [System.IO.File]::GetLastWriteTimeUtc($LockPath)
+        $age = ([DateTime]::UtcNow - $mtime).TotalMilliseconds
+        if ($age -ge $script:LockStaleMs) {
+            return [pscustomobject]@{ Stale = $true; Reason = ('锁文件 mtime 已是 {0} 秒前' -f [math]::Round($age / 1000)) }
+        }
+        return [pscustomobject]@{ Stale = $false; Reason = ('锁文件 mtime 还新（{0} 秒）' -f [math]::Round($age / 1000)) }
+    } catch {
+        return [pscustomobject]@{ Stale = $true; Reason = '锁文件读不到' }
+    }
+}
+
+function Try-AcquireLockOnce {
+    param([string]$Path)
+
+    $lockPath = Get-LockPath -Path $Path
+    $nonce = [System.Guid]::NewGuid().ToString('N')
+    $info = [ordered]@{
+        pid = $PID
+        at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        nonce = $nonce
+        target = [System.IO.Path]::GetFileName($Path)
+    }
+
+    try {
+        # CreateNew = 文件已存在就抛，这是唯一的原子性依赖
+        $fs = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes(($info | ConvertTo-Json -Compress))
+            $fs.Write($jsonBytes, 0, $jsonBytes.Length)
+            $fs.Flush()
+        }
+        finally { $fs.Dispose() }
+
+        return [pscustomobject]@{ Ok = $true; LockPath = $lockPath; Nonce = $nonce; Reason = '获取成功' }
+    }
+    catch {
+        # 已存在 → 看看是否过期
+        if (Test-Path $lockPath) {
+            $st = Test-LockStale -LockPath $lockPath
+            if ($st.Stale) {
+                # 接管：先删再抢（抢那一步仍是原子的）
+                try { [System.IO.File]::Delete($lockPath) } catch { }
+                try {
+                    $fs2 = [System.IO.File]::Open(
+                        $lockPath,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None
+                    )
+                    try {
+                        $jsonBytes2 = [System.Text.Encoding]::UTF8.GetBytes(($info | ConvertTo-Json -Compress))
+                        $fs2.Write($jsonBytes2, 0, $jsonBytes2.Length)
+                        $fs2.Flush()
+                    }
+                    finally { $fs2.Dispose() }
+                    return [pscustomobject]@{ Ok = $true; LockPath = $lockPath; Nonce = $nonce; Reason = ('接管过期锁：' + $st.Reason) }
+                }
+                catch {
+                    return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = '接管时被抢先' }
+                }
+            }
+            return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = ('被占用：' + $st.Reason) }
+        }
+        return [pscustomobject]@{ Ok = $false; LockPath = $lockPath; Nonce = ''; Reason = ('创建锁失败: ' + $_.Exception.Message) }
+    }
+}
+
+# 获取锁（带轮询）。返回 $null 表示抢不到。
+function Enter-FileLock {
+    param(
+        [string]$Path,
+        [int]$TimeoutMs = 0
+    )
+
+    if ($TimeoutMs -le 0) { $TimeoutMs = $script:LockTimeoutMs }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while ($true) {
+        $r = Try-AcquireLockOnce -Path $Path
+        if ($r.Ok) {
+            # 【v0.10.14 修】成功时也显式给 Failed = $false。
+            #   原来成功对象没有这个字段，调用方写 `-eq $false` 会得到 $null 而不成立。
+            #   接口对称，两种写法都可靠。
+            return [pscustomobject]@{ LockPath = $r.LockPath; Nonce = $r.Nonce; Reason = $r.Reason; Failed = $false }
+        }
+        if ($sw.ElapsedMilliseconds -ge $TimeoutMs) {
+            return [pscustomobject]@{ LockPath = ''; Nonce = ''; Reason = $r.Reason; Failed = $true }
+        }
+        [System.Threading.Thread]::Sleep([int]$script:LockPollMs)
+    }
+}
+
+# 释放锁。必须核对 nonce —— 否则会误删别人接管后的新锁。
+function Exit-FileLock {
+    param($Lock)
+
+    if ($null -eq $Lock) { return $false }
+    if ([string]::IsNullOrEmpty($Lock.LockPath)) { return $false }
+    try {
+        $cur = Read-LockInfo -LockPath $Lock.LockPath
+        if ($null -ne $cur -and $cur.nonce -eq $Lock.Nonce) {
+            [System.IO.File]::Delete($Lock.LockPath)
+            return $true
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+# ---------------------------------------------------------------- 带锁的读-改-写（v0.10.14 · D1 第二步）
+#
+# 【为什么要"锁内重读"，而不是用调用方手里的对象】
+#   假设卡片在锁外读到 settings.json 是 {width:320}，
+#   在它拿锁之前，设置窗口已经写入了 {width:320, approvalInline:true}。
+#   如果卡片拿锁后仍用自己那份旧对象做基准，写回时会把
+#   approvalInline 抹掉 —— 锁就白加了。
+#
+#   所以：**拿到锁后必须重新读一次**。
+#
+# @param Path      正式文件
+# @param Merger    收到「当前最新内容」，返回要写入的新内容（scriptblock）
+# @param LogPrefix 日志前缀
+# @returns $true 成功 / $false 失败（不抛）
+function Write-JsonWithLock {
+    param(
+        [string]$Path,
+        [scriptblock]$Merger,
+        [string]$LogPrefix = '写JSON'
+    )
+
+    $lock = $null
+    try {
+        $lock = Enter-FileLock -Path $Path
+        if ($null -eq $lock -or $lock.Failed) {
+            $why = if ($null -ne $lock) { $lock.Reason } else { '未知' }
+            try { Log-Card ('{0}: 抢锁失败（{1}），本次不写' -f $LogPrefix, $why) -Level 'WARN' -Key ($LogPrefix + 'lock') } catch { }
+            return $false
+        }
+
+        # ---- 锁内重读（这是关键）
+        $cur = [ordered]@{}
+        if (Test-Path $Path) {
+            try {
+                $raw = [System.IO.File]::ReadAllText($Path)
+                if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                    $obj = $raw | ConvertFrom-Json
+                    if ($null -ne $obj) {
+                        foreach ($p in $obj.PSObject.Properties) { $cur[$p.Name] = $p.Value }
+                    }
+                }
+            }
+            catch {
+                # 读不出来也不能当成"空对象"然后整份覆盖 —— 那会把用户设置清光。
+                # 这里保留空字典，但记一条日志，让排查时能看到。
+                try { Log-Card ('{0}: 读现有内容失败，将基于空对象写（原内容可能已损坏）' -f $LogPrefix) -Level 'WARN' -Key ($LogPrefix + 'read') } catch { }
+            }
+        }
+
+        # ---- 让调用方决定改什么
+        $next = & $Merger $cur
+        if ($null -eq $next) { return $false }
+
+        # ---- 写回
+        #
+        # 【v0.10.14 修一个会写坏 settings.json 的真 bug】
+        #
+        # 原来这里写的是：
+        #   $payload = [ordered]@{}
+        #   foreach ($p in $next.PSObject.Properties) { $payload[$p.Name] = $p.Value }
+        #   if ($payload.Count -eq 0 -and $next -is [IDictionary]) { foreach ($k in $next.Keys) ... }
+        #
+        # 问题：Merger 返回的是 [ordered] 字典（比如 Save-TopmostSetting 里就是），
+        # 而对 [ordered] 字典调 `.PSObject.Properties` **拿到的不是键值对**，
+        # 而是 .NET 字典对象自身的属性：Count / Keys / Values / IsReadOnly ...
+        #
+        # 于是 $payload 被塞进这些垃圾键，最终写出来的是：
+        #   { "Count": 3, "IsReadOnly": false, "Keys": [...], "Values": [...] }
+        # 而不是用户真正的设置。**这会一次性把 settings.json 写坏，用户设置全丢。**
+        #
+        # 而且 $payload.Count 因为有 4 个垃圾键，不等于 0，
+        # 所以后面那段"退化到 Keys 枚举"的兜底根本没机会执行。
+        #
+        # 修法：先判类型。[ordered] / Hashtable 等 IDictionary 走 Keys，
+        #       普通 pscustomobject 才走 PSObject.Properties。
+        $payload = [ordered]@{}
+        if ($next -is [System.Collections.IDictionary]) {
+            foreach ($k in $next.Keys) { $payload[[string]$k] = $next[$k] }
+        }
+        else {
+            foreach ($p in $next.PSObject.Properties) { $payload[$p.Name] = $p.Value }
+        }
+
+        $json = $payload | ConvertTo-Json -Depth 8
+        return (Write-FileAtomic -Path $Path -Text $json)
+    }
+    catch {
+        try { Log-Fail ($LogPrefix + '异常') $_ } catch { }
+        return $false
+    }
+    finally {
+        if ($null -ne $lock) { [void](Exit-FileLock -Lock $lock) }
+    }
+}
 function Write-FileAtomic {
     param(
         [string]$Path,
@@ -4425,46 +4694,34 @@ function Set-TopmostMode {
 function Save-TopmostSetting {
     param([bool]$Enabled)
     try {
-        $obj = [ordered]@{}
-        if (Test-Path $SettingsPath) {
-            try {
-                $cur = Get-Content $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                if ($null -ne $cur) {
-                    # 保留全部已有键（顺序也保留，方便用户肉眼对比）
-                    foreach ($p in $cur.PSObject.Properties) { $obj[$p.Name] = $p.Value }
-                }
-            } catch { Log-Fail 'L3828' $_ }
+        # ================================================================
+        # 【v0.10.14 · D1 第二步】改用带跨进程锁的读-改-写
+        #
+        # 【改造前的问题】
+        #   下面这段是"读出来 → 改 topmost → 用固定名 $SettingsPath.tmp 写回"。
+        #   而**设置窗口也用同一个 $Path.tmp**（见 Settings.ps1）。
+        #   两个进程同时保存时：
+        #     卡片写 tmp → 设置窗口也写同一个 tmp → 卡片改名拿走对方的半成品
+        #   最终内容可能是"半次卡片 + 半次设置窗口"，而且完全不报错。
+        #
+        # 【现在】
+        #   Write-JsonWithLock 会：抢锁 → **锁内重读最新内容** → 合并 → 原子写 → 放锁。
+        #   锁内重读是关键：不然拿锁前被别人改过的键还是会被这次写覆盖掉。
+        # ================================================================
+        $ok = Write-JsonWithLock -Path $SettingsPath -LogPrefix '保存置顶' -Merger {
+            param($cur)
+            $obj = [ordered]@{}
+            foreach ($k in $cur.Keys) { $obj[$k] = $cur[$k] }
+            $obj['topmost'] = $Enabled
+            return $obj
         }
-        $obj['topmost'] = $Enabled
 
-        $json = $obj | ConvertTo-Json -Depth 8
-        $tmp = "$SettingsPath.tmp"
-        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
-
-        # 【v0.9.14 踩坑：PowerShell 5.1 里没有 File.Move 的三参数重载】
-        #   第一版写的是：
-        #     [System.IO.File]::Move($tmp, $SettingsPath, $true)
-        #   报错：Cannot find an overload for "Move" and the argument count: "3"
-        #
-        #   原因：.NET Framework 的 File.Move 只有 (src, dest) 两个参数；
-        #   "目标已存在时覆盖"的三参数重载是 .NET Core 才加的。
-        #   卡片跑在 Windows PowerShell 5.1（.NET Framework）上，用不了。
-        #
-        #   这个错**不会让卡片崩**（外面有 try/catch），
-        #   后果是"保存静默失败" —— 置顶开关点了没记住，重启回默认值。
-        #   而且只读代码的单测完全发现不了，必须真跑一次写盘才暴露。
-        #   （实测就是这么抓到的：20 次切换全部静默失败，值一个都没变。）
-        #
-        #   修法：目标已存在时先删除，再 Move。
-        #   和本文件其他原子写（Save-Position、审批决定）保持同一套写法。
-        if ([System.IO.File]::Exists($SettingsPath)) {
-            [System.IO.File]::Delete($SettingsPath)
+        if (-not $ok) {
+            try { Log-Card '保存置顶设置失败（已记在锁/写日志里）' -Level 'WARN' -Key 'topmostSave' } catch { }
+            return
         }
-        [System.IO.File]::Move($tmp, $SettingsPath)
 
-        # 先把自己记录的 mtime 更新掉：否则 1 秒后的热更新会以为
-        # "文件变了"而把刚写的这份再完整套用一遍（虽然结果一样，但会多一次
-        # 窗口尺寸重算，拖动手感会有一点抖）。
+        # 先把自己记录的 mtime 更新掉（原逻辑保留）
         try { $script:lastSettingsWrite = [System.IO.File]::GetLastWriteTimeUtc($SettingsPath) } catch { }
     } catch {
         Log-Card ('保存置顶设置失败: ' + $_.Exception.Message)

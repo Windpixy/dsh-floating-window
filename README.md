@@ -87,10 +87,10 @@
 ### 方式一：命令行，从 npm 装（推荐）
 
 ```bash
-dsh plugin --profile <你的 profile> add dsh-floating-window@0.10.11
+dsh plugin --profile <你的 profile> add dsh-floating-window@0.10.13
 ```
 
-> ⚠️ **这条命令里的版本号必须写精确的**（`@0.10.11` 这种），不能只写包名。
+> ⚠️ **这条命令里的版本号必须写精确的**（`@0.10.13` 这种），不能只写包名。
 >
 > 原因：pnpm 11 有个「新版本等待期」机制（`minimumReleaseAge`，默认 **1440 分钟 = 1 天**）。  
 > 一个版本发布后不到这个时间，pnpm 会认为它"太新、还在观察期"而**不去装它**。  
@@ -121,7 +121,7 @@ dsh plugin --profile <你的 profile> add github:Windpixy/dsh-floating-window
 1. 打开 DSH，左侧栏点 **「插件」**
 2. 点 **「添加插件」**
 3. 在输入框里填下面任意一种：
-   - **包名**：`dsh-floating-window@0.10.11` ← 推荐
+   - **包名**：`dsh-floating-window@0.10.13` ← 推荐
    - **Git 地址**：`github:Windpixy/dsh-floating-window`
    - 打包好的压缩包路径
    - 本地文件夹的绝对路径（自己改了代码想试效果时用这个）
@@ -644,7 +644,7 @@ node test/check-card-staleness.mjs
 
 ```bash
 node test/unit.mjs              # 状态换算 74 项
-node test/tokens.mjs            # Token 账本（含按会话统计）35 项
+node test/tokens.mjs            # Token 账本（含按会话统计、口径校正）40 项
 node test/launcher.mjs          # 拉起判断 + 崩溃识别 83 项
 node test/valley.mjs            # 峰谷算法 76 项
 node test/endpoint.mjs          # 地址解析 77 项
@@ -652,17 +652,21 @@ node test/writer-race.mjs       # 原子写盘竞争 7 项
 node test/plugin-wire.mjs       # 插件接线 21 项
 node test/revive-e2e.mjs        # 崩溃后自动恢复 10 项
 node test/approval-proxy.mjs    # 悬浮窗审批代理 85 项
-node test/bar-mode.mjs          # 柱态界面 339 项
+node test/bar-mode.mjs          # 柱态界面 341 项
 node test/freshness.mjs         # 旧代码检测 + 自动重启判据 24 项
 node test/logger.mjs            # 日志轮转与去重 91 项
 node test/staleness-chain.mjs   # 旧代码检测整链（含字段传递）20 项
 node test/restart-window.mjs    # 重启空窗检测 28 项
 node test/c4-async.mjs          # 情况不明复查不阻塞主线程 13 项
+node test/json-store.mjs        # JSON 原子写入与损坏恢复 30 项
+node test/json-lock.mjs         # JSON 并发写入锁 32 项
+node test/d1-four-files.mjs     # 四份状态文件原子写入 29 项
+node test/d3-holiday-cache.mjs  # 节假日缓存与校验 39 项
 ```
 
-合计 **983 项，全部不需要 DSH**。
+合计 **1120 项，全部不需要 DSH**。
 
-> 上面的项数是写这份文档时实测的。**判断标准永远是「失败 0」，不是「正好 983」**——
+> 上面的项数是写这份文档时实测的。**判断标准永远是「失败 0」，不是「正好 1120」**——
 > 每加一个功能这个总数就会变，别拿它当验收依据。
 
 **另外还有一个测量脚本**（不是断言测试，用来量化阻塞时长）：
@@ -677,7 +681,8 @@ node test/c4-blocking-measure.mjs
 ```powershell
 foreach ($f in 'unit','tokens','launcher','valley','endpoint','writer-race',
                'plugin-wire','revive-e2e','approval-proxy','bar-mode',
-               'freshness','logger','staleness-chain','restart-window','c4-async') {
+               'freshness','logger','staleness-chain','restart-window','c4-async',
+               'json-store','json-lock','d1-four-files','d3-holiday-cache') {
   Write-Host "=== $f ===" -ForegroundColor Cyan
   node "test/$f.mjs"
 }
@@ -758,7 +763,21 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File test/m4-acceptance.ps1 
 图形化设置界面、日志功能、深色壁纸自适应、代码更新自动重启、
 **任务行显示本次会话 Token**（v0.10.0）。
 
-本版本 **v0.10.11**。
+### v0.10.12 / v0.10.13 的数据安全加固
+
+这两版没有加新功能，做的是**让状态文件的写入不会互相踩、不会写坏**：
+
+| 项 | 做了什么 | 为什么 |
+|---|---|---|
+| **D2** Token 口径校正 | 统一了 Token 统计与官方账本的口径，补了 139 项测试 | 之前某些场景下算出来的数和官方对不上 |
+| **D1** JSON 原子写入 | 四份状态文件（`state.json` / `settings.json` / `panel-pos.json` / `heartbeat.json`）改成原子写入 | 多个进程同时写同一个文件时，可能出现"读到半个文件"的情况 |
+| **D1** 并发写入锁 | 加了 `json-lock` 机制，写入前先拿锁 | 卡片、设置窗口、插件三方都会改 `settings.json`，没锁会互相覆盖 |
+| **D3** 节假日缓存校验 | 新增 `holiday-validate.js`，缓存数据先校验再用 | 缓存文件损坏或被改坏时，峰谷判断会出错 |
+
+> 这几项的问题都**很难复现**（要恰好卡在"写一半"的时刻），
+> 所以改动虽小，测试补得比代码多：新增 4 个套件、130 项测试。
+
+本版本 **v0.10.13**。
 
 ---
 
