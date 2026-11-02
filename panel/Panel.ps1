@@ -6903,7 +6903,8 @@ function Export-DiagnosticPackage {
         #
         # 【⚠️ 安全边界：这几个绝对不能打包】
         #   decisions/   —— 审批决定的 nonce，属于凭据
-        #   tokens.json  —— Token 用量（用户自己看无所谓，但没必要外传）
+        #   Token 的分会话明细 —— 不存在独立文件：账本只活在插件内存里。
+        #                        但**汇总数字会随 state.json 带出**，这点已在下面隐私说明里告知。
         #   holidays.json —— 无意义的几百 KB
         #   这里用白名单而不是黑名单：新增文件不会意外被打包进去。
         $stateSpecs = @('state.json', 'settings.json', 'heartbeat.json', 'panel-pos.json')
@@ -7017,10 +7018,17 @@ function Export-DiagnosticPackage {
         [void]$envLines.Add('--- 隐私说明 ---')
         [void]$envLines.Add('本压缩包【不包含】:')
         [void]$envLines.Add('  · 审批凭据（decisions 目录）')
-        [void]$envLines.Add('  · Token 用量明细（tokens.json）')
+        # 【v0.10.12 · D2 更正】原来这里写的是"Token 用量明细（tokens.json）"。
+        #   但**根本没有 tokens.json 这个文件**（Token 账本只在内存里）。
+        #   真正的隐私边界是：**Token 数字会随 state.json 带出**，
+        #   只是没有单独的明细文件。说清这点比含糊承诺"不包含明细"更诚实。
+        [void]$envLines.Add('  · Token 的分会话明细（插件不落盘，本机没有这个文件）')
         [void]$envLines.Add('  · 任何密码 / 密钥 / 登录信息')
         [void]$envLines.Add('')
         [void]$envLines.Add('本压缩包【可能包含】:')
+        # 【v0.10.12 · D2】原来没写这一条。state.json 里有今日 Token 总额
+        #   和每行任务的 Token，属使用信息，和"路径"一样属于需要告知的范围。
+        [void]$envLines.Add('  · 今日 Token 汇总和各任务的 Token 数（来自 state.json）')
         [void]$envLines.Add('  · 你的文件路径（例如 C:\Users\<你的用户名>\...）')
         [void]$envLines.Add('    —— 这对排查"文件找不到"这类问题是必需的，因此未做打码')
         [void]$envLines.Add('')

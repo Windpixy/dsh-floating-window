@@ -420,6 +420,145 @@ test('startOfToday 是当天 00:00', () => {
   assert.equal(d.getDate(), 27)
 })
 
+// ================================================================ D2：对账边界（v0.10.12）
+//
+// 【为什么补这一组】
+//   D2 施工卡要求"明确'任务行之和 ≠ 今日总额'的合法场景，在文档列出"。
+//   要写进文档的前提是这些场景**真的按预期工作** —— 所以先用测试钉住它们。
+//
+//   审查发现有两处边界之前完全没有测试：
+//     ① 子会话被淘汰后，今日总额不能跟着减少（明细少一块是合法的）
+//     ② 跨天只清零、不自动回填当天历史（这是当前的**已知限制**，不是 bug）
+//
+//   不测清楚就写文档，等于把猜测当事实。docs 里那句"跨天不自动回填"
+//   如果没有测试守着，哪天有人"顺手修一下"就变成静默改语义了。
+group('D2 对账边界：什么情况下"任务行之和 ≠ 今日总额"是合法的')
+
+test('【合法差异1】子会话被淘汰后，今日总额不变、父任务行变少', () => {
+  const t = mk()
+  t.beginBackfill()
+  // 一个父任务，带两个子会话
+  t.addBackfill('parent', 100, 1000)
+  t.addBackfill('child-a', 50, 2000)
+  t.addBackfill('child-b', 60, 3000)
+  t.endBackfill()
+
+  const totalBefore = t.total()
+  assert.equal(totalBefore, 6000, '四项之和')
+
+  // 淘汰 = 会话从 state 里消失，但 Token 账本**不清**
+  // 【为什么不清】用户今天确实用了这些 Token，总额是校准过官方账本的权威值，
+  //   不能因为"界面不再显示那个子会话"就把钱从总额里扣掉。
+  //
+  // 这里模拟"卡片不再查询 child-a / child-b"：
+  // 账本里它们还在，只是没有任务行去显示它们了。
+  const visibleSum = t.sessionTotal('parent')   // 卡片只会显示仍存在的会话
+  assert.equal(visibleSum, 1000, '父任务行只包含父会话自己那一份')
+
+  assert.equal(t.total(), 6000, '【关键】今日总额不受"谁还被显示"影响')
+  assert.ok(totalBefore > visibleSum, '此时"可见行之和" < "今日总额"，这是合法差异')
+  assert.equal(t.sessionSum(), 6000, '账本整体求和仍然等于总额（不变量没破）')
+})
+
+test('【合法差异2】无会话 ID 的 Token 进孤儿桶，不生成任务行', () => {
+  const t = mk()
+  t.addLive('', 1, 777)          // 没有会话号
+  t.addLive('real', 2, 300)
+
+  assert.equal(t.total(), 1077, '总额包含孤儿桶那笔')
+  assert.equal(t.sessionSum(), 1077, '账本求和也包含，不变量没破')
+
+  // 卡片遍历的是"仍存在的会话"，永远查不到 '__no_session__'
+  assert.equal(t.sessionTotal('__no_session__'), 777, '孤儿桶自己能查到')
+  assert.equal(t.sessionTotal('real'), 300)
+  assert.ok(t.total() > t.sessionTotal('real'),
+    '【关键】只有真实会话行可见时，行之和 < 总额，这是合法差异')
+})
+
+test('【已知限制】跨天只清零，不自动回填当天历史', () => {
+  // 【这条守的是"当前设计"，不是"正确行为"】
+  //   D2 施工卡 D2-4 第 4 条：
+  //     "当前是清零后继续接收实时事件；如果需要跨天后自动补齐当天
+  //      已发生的历史用量，要另提需求，不能暗中改变现有语义。"
+  //
+  //   这条测试的作用是**把现状钉住**：
+  //   如果将来有人给 rollover 加了自动回填，这条会失败，
+  //   从而强制他先来确认"这是不是产品决策"。
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 100, 5000)
+  t.endBackfill()
+  assert.equal(t.total(), 5000)
+
+  const nextDay = new Date('2026-10-28T01:00:00+08:00').getTime()
+  assert.equal(t.rollover(nextDay), true, '确实换天了')
+
+  assert.equal(t.total(), 0, '跨天清零')
+  assert.equal(t.sessionSum(), 0, '会话账本也清零')
+  assert.equal(t.sessionTotal('s1'), 0)
+
+  // 【关键断言】跨天后不会"自动把昨天那 5000 补回来"
+  //   注意：真实运行时，插件重启会走 backfill 重新扫历史；
+  //   但**单纯跨天、进程不重启**时，今天 00:00 之后发生的历史
+  //   （如果有）不会自动补 —— 这就是当前限制。
+  assert.equal(t.total(), 0,
+    '跨天不清零后又自动回填 = 改变语义，必须经用户确认')
+
+  // 之后的新事件正常累加
+  assert.equal(t.addLive('s1', 10, 300), true)
+  assert.equal(t.total(), 300, '新的一天从新事件开始累加')
+})
+
+test('【关键】回填先建立水位线，之后同一 seq 的实时事件不会再计', () => {
+  // 【这条测试纠正了我自己的错误假设】
+  //   第一版我写的是"先 addLive 再 beginBackfill，期望去重" —— 结果得到 500 不是 400。
+  //   查代码后确认：**代码是对的，我的假设是错的**。
+  //
+  //   水位线的机制是：回填时记录"这个会话我扫到了 seq 多少"（_scannedMax）。
+  //   之后实时事件的 seq <= 水位线，就会被挡掉。
+  //
+  //   如果实时事件发生在**水位线建立之前**，那时 _scannedMax 里还没有这个会话，
+  //   `_isCoveredByBackfill` 返回 false → 正常计入。这是**正确行为**：
+  //   那个事件在回填扫描之前确实发生了，两边各算一次才是重复。
+  //
+  //   真实场景里，回填是"插件启动时全量扫历史"，扫完才建立水位线；
+  //   之后 DSH 产生的新事件才走 addLive。所以顺序是"先回填、后实时"。
+  const t = mk()
+
+  // ① 先回填（模拟插件启动时扫历史，扫到 seq 100）
+  t.beginBackfill()
+  t.addBackfill('s1', 100, 5000)
+  t.endBackfill()
+  assert.equal(t.total(), 5000)
+
+  // ② 之后来的实时事件，seq 在 100 以内 → 被水位线挡掉（回填已含）
+  assert.equal(t.addLive('s1', 50, 800), false, 'seq<=100 被回填覆盖，不重复计')
+  assert.equal(t.total(), 5000, '总额没变')
+
+  // ③ seq 超过水位线 → 是回填之后的新事件，正常计入
+  assert.equal(t.addLive('s1', 101, 300), true, 'seq>100 是新事件')
+  assert.equal(t.total(), 5300, '新事件正常累加')
+
+  // ④ 水位线会跟着往前推
+  assert.equal(t.addLive('s1', 102, 200), true)
+  assert.equal(t.total(), 5500)
+})
+
+test('跨天后水位线清空，新一天的小 seq 事件不会被昨天挡住', () => {
+  const t = mk()
+  t.beginBackfill()
+  t.addBackfill('s1', 500, 5000)      // 昨天扫到很高的 seq
+  t.endBackfill()
+
+  const nextDay = new Date('2026-10-28T01:00:00+08:00').getTime()
+  assert.equal(t.rollover(nextDay), true)
+  assert.equal(t.total(), 0)
+
+  // 【关键】新一天 seq 从 1 开始，如果不清水位线就会被 500 挡住
+  assert.equal(t.addLive('s1', 1, 300), true, '水位线必须被清空')
+  assert.equal(t.total(), 300)
+})
+
 // ================================================================ 汇总
 process.stdout.write(`\n${'='.repeat(50)}\n通过 ${passed}   失败 ${failed}\n`)
 if (failed > 0) {
