@@ -97,21 +97,166 @@ $script:StaleMs = 8000
 
 function Test-AnotherInstanceAlive {
     param([string]$HbPath, [int]$StaleMs)
+
     if (-not (Test-Path $HbPath)) { return $false }
-    try {
-        $hb = Get-Content $HbPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $hb -or $hb.alive -ne $true) { return $false }
-        $at = [long]$hb.updatedAtMs
-        if ($at -le 0) { return $false }
-        $nowMs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
-        $age = $nowMs - $at
-        if ($age -lt 0 -and $age -gt -10000) { return $true }   # 时钟略微不准，当作活着
-        if ($age -ge $StaleMs) { return $false }                 # 过期了，认为已经没了
-        return $true
-    } catch {
-        # 心跳文件正好在被写（读到半截）时解析失败，当作没实例
-        return $false
+
+    # ================================================================
+    # 【2026-11-03 修：读到半截不能当成"没有实例"】
+    #
+    # 【出了什么事】
+    #   本机出现过 **3 张卡片同时运行**（pid 25260 / 14268 / 29172），
+    #   桌面上叠着多张卡，心跳每 2 秒被其中一个覆盖一次。
+    #
+    # 【根因链】
+    #   心跳是"写 tmp → 改名覆盖"（见 Write-Heartbeat）。
+    #   改名是原子的，但**写 tmp 不是**。旧代码里 tmp 名字写死成
+    #   heartbeat.json.tmp，多个卡片进程共用同一个临时文件，
+    #   于是 A 写到一半、B 也往里写 —— 主文件在下一次改名时
+    #   可能拿到一份"A 的头 + B 的尾"的残缺内容。
+    #
+    #   而这里原来写的是 catch { return $false }，含义是
+    #   "解析失败 = 没有别的实例 = 放行"。两件事叠加：
+    #     A 正在写 → B 启动读到半截 → 解析失败 → B 判定没实例 → B 也起来
+    #   —— 越起越多。
+    #
+    # 【为什么改成"重试 + 保守挡住"】
+    #   两种情况必须区分开，它们的正确处置**完全相反**：
+    #
+    #   ① 文件不存在            → 真的可能没有卡片 → 放行（false）
+    #   ② 文件在、但内容读不全  → **极可能正有一个卡片在写心跳** → 挡住（true）
+    #
+    #   第二类原来被误判成"没有"，这是 bug 的核心。
+    #   宁可多挡一次（用户手动跑 run-panel.bat 也能起来），
+    #   也不能叠卡片 —— 叠了之后用户点错窗口、心跳互相覆盖，
+    #   比"卡片没自动起来"难排查得多。
+    #
+    #   先重试几次给写入方几十毫秒把名字改完（心跳每 2 秒一次，
+    #   改名的窗口只有微秒级，绝大多数情况第一次重试就读到了）。
+    #   重试仍读不全，才保守判为"有实例"。
+    #
+    # 【会不会永远挡住、卡片再也起不来】
+    #   不会。这个函数只在**启动时**跑一次。
+    #   如果那个"正在写的进程"其实已经死了，它留下的残缺 tmp
+    #   不会自己变成合法心跳；下面 ③ 会在启动时清掉旧 tmp。
+    #   而且主心跳过期判据（age >= StaleMs）仍然生效 ——
+    #   只要磁盘上的心跳超过 8 秒没更新，照样放行。
+    # ================================================================
+    $attempts = 3
+    for ($i = 0; $i -lt $attempts; $i++) {
+        try {
+            $raw = [System.IO.File]::ReadAllText($HbPath, [System.Text.Encoding]::UTF8)
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+                # 空文件：也是"正被写"的一种形态（刚被清空还没写内容）
+                if ($i -lt ($attempts - 1)) { [System.Threading.Thread]::Sleep(50); continue }
+                return $true
+            }
+            $hb = $raw | ConvertFrom-Json
+            if ($null -eq $hb) {
+                if ($i -lt ($attempts - 1)) { [System.Threading.Thread]::Sleep(50); continue }
+                return $true
+            }
+            if ($hb.alive -ne $true) { return $false }
+            $at = [long]$hb.updatedAtMs
+            if ($at -le 0) { return $false }
+            $nowMs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+            $age = $nowMs - $at
+            if ($age -lt 0 -and $age -gt -10000) { return $true }   # 时钟略微不准，当作活着
+            if ($age -ge $StaleMs) {
+                # ============================================================
+                # 【D6 · 2026-11-03】心跳过期 ≠ 进程退出
+                #
+                # 【为什么不能再直接 return $false —— 真实事故】
+                #   本机曾经同时跑着 3 张卡片（pid 25260 / 14268 / 29172），
+                #   桌面上叠着多张，心跳在多进程间轮流覆盖。
+                #
+                #   翻日志能看清完整链条：
+                #     11:21:13  拉起 pid=25260（它一直活着，直到 12:45 被手动结束）
+                #     11:39:57  心跳过期 13 秒
+                #     11:40:00  插件以为没了，又拉起 pid=22324
+                #     11:40:06  插件报"等到的心跳不是这次启动的进程（实际 25260）"
+                #               ← 这行反证了 25260 当时还活着
+                #     11:40:15  再拉起 pid=14268            ← 第三张
+                #
+                #   根因：**旧卡片从未退出，只是有一段时间没写心跳**
+                #   （进程被系统挂起、界面线程卡住、或睡眠唤醒那一小段）。
+                #
+                # 【这个函数也要负一半责任】
+                #   插件那边以为"过期=没了"于是不断拉新卡片；
+                #   新卡片启动时跑到这里，读到的是"过期 15 秒"的心跳，
+                #   同样判成"没有实例"于是放行 —— **两边同时犯错，越起越多**。
+                #
+                # 【改法：过期之后，去问系统"那个 pid 还在不在"】
+                #   · 还在      → 有实例，不放行（这正是挡住第二张卡的关键）
+                #   · 确实没了  → 不是实例，放行（真的可以接管）
+                #   · 查不出来  → 保守当"有实例"（宁可少一张卡，也不叠卡）
+                #
+                # 【为什么"查不出来"要保守挡住】
+                #   权限不足 / 进程刚巧在查的瞬间退出，都会查不出来。
+                #   挡住一次的代价是"用户手动跑 run-panel.bat 也起不来"——
+                #   等等，这个代价其实不小。所以这里要想清楚：
+                #
+                #   查不出来时挡住 = 最坏情况卡片没自动起来，用户手动也起不来吗？
+                #   不会。用户手动跑 run-panel.bat 时，如果旧进程真的没了，
+                #   心跳仍然是"过期的旧记录"，还是查不出来，还是被挡住 ——
+                #   那用户就**真的**起不来了。这个风险不能接受。
+                #
+                #   所以：查不出来时**放行**（信任"过期"这个信号），
+                #   只有**明确查到进程还在**时才挡住。
+                #   这样最坏情况退回今天的行为（可能叠卡），
+                #   但绝不会出现"卡片永远起不来"。
+                #   —— 叠卡难受，起不来更难受，两害相权取轻。
+                # ============================================================
+                $pidRaw = $hb.pid
+                $pidNum = 0
+                $pidOk = [int]::TryParse([string]$pidRaw, [ref]$pidNum)
+                if (-not $pidOk -or $pidNum -le 0) {
+                    # 心跳里没记 pid（极老版本卡片）—— 判断不了，按原逻辑放行
+                    return $false
+                }
+                $stillAlive = $false
+                try {
+                    $proc = Get-Process -Id $pidNum -ErrorAction Stop
+                    # 拿到对象就算存在（极少数情况会拿到空壳，这里只认非空）
+                    $stillAlive = ($null -ne $proc)
+                } catch {
+                    # 查不到该 pid —— 它确实不存在了（Get-Process 对不存在的 pid 抛异常）
+                    $stillAlive = $false
+                }
+                if ($stillAlive) {
+                    # 进程还在，只是没写心跳 —— 判定"有实例"，不放行
+                    return $true
+                }
+                # 进程确实没了 —— 才是真的可以接管
+                return $false
+            }
+            return $true
+        } catch {
+            # 【关键】解析失败 = 正被写，不是"没有实例"。
+            #   给写入方一点时间改完名，然后重读。
+            if ($i -lt ($attempts - 1)) {
+                [System.Threading.Thread]::Sleep(50)
+                continue
+            }
+            # 重试完了还读不全 —— 保守当作"有实例"，挡住第二个卡片。
+            return $true
+        }
     }
+    return $true
+}
+
+# 【启动时清一次旧版留下的固定名临时文件】
+#   旧版本把 tmp 写死成 heartbeat.json.tmp（见下面 Write-Heartbeat 的说明）。
+#   升级到新版本后，如果那次写入正好被打断，盘上会残留一个孤儿文件。
+#   它不会自己消失，也永远不会被改名成正式心跳（因为新代码用别的名字），
+#   留着只是垃圾。这里顺手删掉。
+#   只删这一个精确名字 —— 不按 *.tmp 通配，避免误删别的模块正在用的临时文件。
+try {
+    $legacyTmp = "$HeartbeatPath.tmp"
+    if (Test-Path -LiteralPath $legacyTmp) {
+        Remove-Item -LiteralPath $legacyTmp -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    # 【故意静默】清个残留文件失败没有任何可见后果
 }
 
 if (Test-AnotherInstanceAlive -HbPath $HeartbeatPath -StaleMs $script:StaleMs) {
@@ -174,7 +319,28 @@ function Write-Heartbeat {
             scriptStampMs = $script:scriptStampMs
         }
         $json = $hb | ConvertTo-Json -Compress
-        $tmp = "$HeartbeatPath.tmp"
+
+        # ================================================================
+        # 【2026-11-03 修：临时文件名必须**每进程唯一**】
+        #
+        # 【原来为什么不行】
+        #   写死成 "$HeartbeatPath.tmp" = 固定名 heartbeat.json.tmp。
+        #   多个卡片进程（或卡片 + 任何并发写者）同时写时共用这一个临时文件：
+        #     A 写一半 → B 覆盖它的开头 → A 改名 → 主文件是拼起来的残缺内容
+        #   改名的原子性只管"改名这一步"，管不了"临时文件被别人写坏"。
+        #   这正是 3 张卡片叠在一起时心跳内容来回跳的直接原因。
+        #
+        # 【为什么带 pid + 随机串】和 D1 第二步给 settings.json 的做法一致：
+        #   · pid    —— 不同进程绝不会撞
+        #   · 随机串 —— 同一进程内万一快速重入（比如两处同时调）也不撞
+        #   · 前导点 + .tmp 结尾 —— 和 json-store.js 生成的临时名同一种形状，
+        #     将来写"清理工具"时一条规则就能覆盖所有模块的临时文件
+        #
+        # 【为什么用 NewGuid 而不是 Random】
+        #   这里是每 2 秒一次的写入，不在什么极端性能路径上；
+        #   NewGuid 由系统保证唯一，比自己拼随机数更省心。
+        # ================================================================
+        $tmp = Join-Path $DataDir ('.heartbeat.' + $PID + '.' + ([guid]::NewGuid().ToString('N').Substring(0, 8)) + '.tmp')
         [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -Path $tmp -Destination $HeartbeatPath -Force -ErrorAction SilentlyContinue
     # 【故意静默】失败无害，下个周期会自动重试；记了会把日志刷爆
@@ -823,6 +989,18 @@ function Invoke-LogMaintenance {
                     # 移动失败（文件被占用）就退一步：把主文件清空。
                     # 宁可丢历史，也不能让主文件无限长下去 —— 
                     # 磁盘写满会让整个卡片出更奇怪的问题。
+                    #
+                    # 【D4 第五类问题：清空前必须留一句话】
+                    #   原来这里是**纯静默**清空的：用户事后只会看到
+                    #   "panel.log 怎么忽然短了一截"，完全不知道丢了什么、
+                    #   为什么丢。而现在恰恰是最需要留证据的时刻 ——
+                    #   改名失败说明有别的程序（杀毒 / 备份）在抢这个文件，
+                    #   那往往和"状态文件也写不进去"是同一个根因。
+                    #   所以先把大小记下来，清空之后再补一行 WARN。
+                    #   用 -Key 去重：60 秒内同类只记一条，避免告警自己刷屏。
+                    $lostBytes = 0
+                    try { $lostBytes = (Get-Item $script:cardLogPath -ErrorAction SilentlyContinue).Length } catch { }
+                    $lostKb = [int]($lostBytes / 1024)
                     try {
                         [System.IO.File]::WriteAllText($script:cardLogPath, '',
                             (New-Object System.Text.UTF8Encoding($false)))
@@ -833,6 +1011,12 @@ function Invoke-LogMaintenance {
                         #   下一次轮转检查（60 秒后）还会再试。
                         #   最坏情况就是主文件暂时超过 2MB，不影响功能。
                     }
+                    # 清空动作做完（成功或失败）都留一句：丢了多少、为什么。
+                    # 写在 try 外面、但仍在 catch 分支里，是因为这里已经离开了
+                    # "不能记日志"的危险区（主文件已空，不会再递归刷爆）。
+                    try {
+                        Log-Card ('日志轮转失败（目标文件被占用），已清空 panel.log，丢失约 ' + $lostKb + ' KB 历史；常见原因是杀毒/备份软件正在读取该文件') -Level 'WARN' -Key 'logRotateFail'
+                    } catch { }
                 }
             }
         }
@@ -855,6 +1039,136 @@ function Invoke-LogMaintenance {
     } catch {
         # 维护失败不影响写日志，静默即可（这里失败最多是"没轮转成"，
         # 下次 60 秒后还会再试）
+    }
+}
+
+# ================================================================
+# panel-debug.log 的轮转 + 清理（D4 新增）
+#
+# 【为什么不能复用 Invoke-LogMaintenance】
+#   那个函数里写死了 $script:cardLogPath（panel.log）和 'panel.<stamp>.log'
+#   这个命名。改成带参数会让它同时管两份日志，容易出两类事故：
+#     · 改动一边时忘了另一边（项目历史上踩过一模一样的坑：
+#       plugin 和 panel 两边各写一套轮转，最后只改了一边）
+#     · 清理正则一旦写松，'panel.*.log' 会**同时**匹配 panel.log
+#       和 panel-debug.log —— 那等于把用户正在看的主日志删了
+#   所以这里用**完全独立的命名前缀** panel-debug.，配一条独立的、
+#   窄到不可能误伤的清理正则。两套互不影响，改坏一个另一个还活着。
+#
+# 【⚠️ 清理正则的硬约束】
+#   只认 ^panel-debug\.\d{8}-\d{6}\.log$
+#   不能写成 panel-debug*（会匹配主文件本身）
+#   也不能写成 panel*（会连 panel.log / panel.<stamp>.log 一起删）
+#   "删文件"是本项目里最危险的几行代码之一，名字必须逐字符对齐。
+# ================================================================
+function Invoke-DebugLogMaintenance {
+    try {
+        # ---- ① 超限就轮转
+        if (Test-Path $script:debugPath) {
+            $size = (Get-Item $script:debugPath -ErrorAction SilentlyContinue).Length
+            if ($null -ne $size -and $size -ge $script:DebugMaxBytes) {
+                $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+                $rotated = Join-Path $DataDir ('panel-debug.' + $stamp + '.log')
+                if (Test-Path $rotated) {
+                    # 同一秒内撞名（极少见，但真会发生）：加序号避免覆盖
+                    $n = 2
+                    while ((Test-Path $rotated) -and $n -le 9) {
+                        $rotated = Join-Path $DataDir ('panel-debug.' + $stamp + '-' + $n + '.log')
+                        $n++
+                    }
+                }
+                try {
+                    [System.IO.File]::Move($script:debugPath, $rotated)
+                    # 【关键】Move 是"移动"不是"复制"：主文件此刻已经不存在了。
+                    #   立刻建一个空文件，让"主文件永远存在"成为不变量。
+                    #   否则诊断包导出会走"文件不存在 → 跳过"的分支，
+                    #   用户明明开着调试，包里却没有 debug 日志
+                    #   （而等他再去看时又有了 —— 这种"时有时无"最难查）。
+                    try {
+                        [System.IO.File]::WriteAllText($script:debugPath, '',
+                            (New-Object System.Text.UTF8Encoding($false)))
+                    } catch {
+                        # 【故意静默 · 日志系统自身】建不出空文件也无妨：
+                        #   下一次 AppendAllText 会自动创建它
+                    }
+                } catch {
+                    # 挪不动（被占用）就退一步清空主文件，但必须先留一句话。
+                    # 这是 D4 第五类问题的同一个原则：宁可丢内容，不能丢"丢过"这件事。
+                    $lostKb = [int]($size / 1024)
+                    try {
+                        [System.IO.File]::WriteAllText($script:debugPath,
+                            ('[调试日志轮转失败，已清空，丢失约 {0} KB]' -f $lostKb) + "`r`n",
+                            (New-Object System.Text.UTF8Encoding($false)))
+                    } catch {
+                        # 【故意静默 · 日志系统自身】连清空都失败，下次 60 秒再试
+                    }
+                }
+            }
+        }
+
+        # ---- ② 删掉超过保留天数的 debug 轮转文件
+        $cutoff = (Get-Date).AddDays(-$script:DebugKeepDays)
+        $files = @(Get-ChildItem -Path $DataDir -Filter 'panel-debug.*.log' -File -ErrorAction SilentlyContinue)
+        foreach ($f in $files) {
+            # 严格匹配轮转命名，多一个字符都不删
+            if ($f.Name -notmatch '^panel-debug\.\d{8}-\d{6}(-\d+)?\.log$') { continue }
+            if ($f.LastWriteTime -lt $cutoff) {
+                try { [System.IO.File]::Delete($f.FullName) } catch { }
+            }
+        }
+
+        # ---- ③ 只留最近 N 个（按修改时间倒序，超出的删掉）
+        #   【为什么天数之外还要数量】
+        #     一天内在 900ms 刷屏的情况下 2MB 可能几分钟就到了，
+        #     15 天内攒下几百个 2MB 文件 = 几百 MB 磁盘。
+        #     天数是"隐私边界"，数量是"磁盘边界"，两道都得有。
+        $rotatedAll = @(Get-ChildItem -Path $DataDir -Filter 'panel-debug.*.log' -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^panel-debug\.\d{8}-\d{6}(-\d+)?\.log$' } |
+                        Sort-Object LastWriteTime -Descending)
+        if ($rotatedAll.Count -gt $script:DebugKeepCount) {
+            for ($i = $script:DebugKeepCount; $i -lt $rotatedAll.Count; $i++) {
+                try { [System.IO.File]::Delete($rotatedAll[$i].FullName) } catch { }
+            }
+        }
+    } catch {
+        # 【故意静默 · 日志系统自身】维护失败不影响改色主循环，下一轮再试
+    }
+}
+
+# 写一条调试日志（D4 统一入口）
+#
+# 【为什么要有这个函数，而不是继续在各处直接 AppendAllText】
+#   原来有 4 处直接往 $script:debugPath 追加，每处自己一套 try/catch
+#   （其中两处是空 catch）。加轮转就必须**每个写入口都顺手检查一次**，
+#   4 处分散着写，早晚会漏掉一处 —— 漏掉的那处就成了"永远不轮转"的口子。
+#   集中成一个入口之后，"写 + 节流检查"只有一份实现。
+#
+# 【写失败绝不能影响改色主循环】
+#   调试日志是排障用的旁路，不是功能。900ms 的主循环里任何一行
+#   都不允许因为"日志写不进去"而中断。所以整个函数包在 try/catch 里，
+#   catch 里什么都不做 —— 这和处理"日志系统自身"的其他几处是同一个原则。
+function Write-DebugLog {
+    param([string]$Text)
+
+    if (-not $script:debugOn) { return }
+
+    try {
+        [System.IO.File]::AppendAllText($script:debugPath, $Text + "`r`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        # 【故意静默 · 日志系统自身】写不进去就算了，绝不能影响调用方
+        return
+    }
+
+    # ---- 轮转检查：60 秒一次，别每次写都去 stat
+    try {
+        $now = [datetime]::Now
+        if (($now - $script:DebugLastCheck).TotalMilliseconds -ge $script:DebugCheckMs) {
+            $script:DebugLastCheck = $now
+            Invoke-DebugLogMaintenance
+        }
+    } catch {
+        # 【故意静默 · 日志系统自身】维护失败不影响已经写成功的那一行
     }
 }
 
@@ -2490,9 +2804,36 @@ $script:shadowInit = if ($script:curIsLight) {
 #   而且插件的日志也写在那里，两边能对着看同一条时间线。
 $script:debugOn = ($env:DSH_PANEL_DEBUG -eq '1') -or ($env:DSH_PANEL_DEBUG -eq 'true')
 $script:debugPath = Join-Path $DataDir 'panel-debug.log'
-if ($script:debugOn) {
-    try { [System.IO.File]::WriteAllText($script:debugPath, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
-}
+
+# ================================================================
+# 调试日志的留存边界（D4：原来完全没有）
+#
+# 【原来有两个问题，用户已拍板要改】
+#
+#   ① 开调试就整份清空（原来这里是 WriteAllText(..., '')）
+#      「打开调试开关」这个动作本身往往发生在**问题刚出现之后**。
+#      一重启就把上一轮的唯一记录清掉，等于每次都从零开始，
+#      看不到"上次也这样""昨天这个时间也白字"这类最有用的线索。
+#      现在改成接着往后写，靠下面的轮转把总量控住。
+#      代价：文件会跨多次调试会话累积 —— 但这正是想要的（能对比）。
+#
+#   ② 没有大小/数量/天数边界
+#      实测一次排障就能写到 1.5MB（判色是 900ms 一次，抓屏失败还会刷）。
+#      原来是"开调试 → 重启 → 清空"这种偶然的重置在兜底，
+#      一旦不清空了，就必须有真正的上限。
+#
+# 【参数为什么和 panel.log 同一套（用户拍板）】
+#   2MB 轮转 / 留最近 3 个 / 15 天到期 —— 和主日志完全一致。
+#   三份日志（plugin / panel / panel-debug）用同一把尺子，
+#   以后写"清理工具"或向用户解释"能翻多久"时不用记两套规则。
+#   debug 日志比主日志写得密，所以 2MB 会比 panel.log 更早到，
+#   这是预期的 —— 它本来就是个临时的、量大的东西。
+# ================================================================
+$script:DebugMaxBytes = 2 * 1024 * 1024      # 超过就轮转（2MB）
+$script:DebugKeepCount = 3                   # 最多留几个轮转文件（最近的）
+$script:DebugKeepDays = 15                   # 最多留多少天（和主日志同拍板值）
+$script:DebugLastCheck = [datetime]::MinValue
+$script:DebugCheckMs = 60000                 # 60 秒查一次大小，别每次写都 stat
 
 # ================================================================ 相对亮度（v0.9.6 新增）
 #
@@ -2792,9 +3133,7 @@ function Update-AdaptiveText {
                     }
                     if ($shouldLog) {
                         $script:captureFailLoggedAt = $nowTick
-                        [System.IO.File]::AppendAllText($script:debugPath,
-                            ('{0} CAPTURE-FAIL colours={1} kind={2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'), $colourCount, $kind) + "`r`n",
-                            (New-Object System.Text.UTF8Encoding($false)))
+                        Write-DebugLog -Text ('{0} CAPTURE-FAIL colours={1} kind={2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'), $colourCount, $kind)
                     }
                 } catch { }
             }
@@ -3005,8 +3344,7 @@ function Update-AdaptiveText {
                     ($vals | Measure-Object -Property Sort -Average).Average,
                     ($sorted[[int]($sorted.Count * 0.10)].Sort), ($sorted[[int]($sorted.Count * 0.90)].Sort),
                     $vals.Count, $(if ($wantLightText) { '白字' } else { '黑字' }))
-                [System.IO.File]::AppendAllText($script:debugPath, $line + "`r`n",
-                    (New-Object System.Text.UTF8Encoding($false)))
+                Write-DebugLog -Text $line
             } catch { Log-Fail 'L2628' $_ }
         }
 
@@ -3163,8 +3501,7 @@ function Update-AdaptiveText {
                 $okMark = if ($actualHex -eq $expectHex) { 'OK' } else { 'MISMATCH' }
                 $line = ('{0} applied={1} expect={2} {3} wantLight={4}' -f `
                     (Get-Date -Format 'HH:mm:ss'), $actualHex, $expectHex, $okMark, $wantLight)
-                [System.IO.File]::AppendAllText($script:debugPath, $line + "`r`n",
-                    (New-Object System.Text.UTF8Encoding($false)))
+                Write-DebugLog -Text $line
             } catch { Log-Fail 'L2786' $_ }
         }
 
@@ -3240,10 +3577,8 @@ function Update-AdaptiveText {
                 $lastExc = $script:adaptiveExcLoggedAt
                 if ($null -eq $lastExc -or ($nowExc - $lastExc).TotalSeconds -ge 60) {
                     $script:adaptiveExcLoggedAt = $nowExc
-                    [System.IO.File]::AppendAllText($script:debugPath,
-                        ('{0} EXCEPTION {1}: {2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'),
-                         $_.Exception.GetType().Name, $_.Exception.Message) + "`r`n",
-                        (New-Object System.Text.UTF8Encoding($false)))
+                    Write-DebugLog -Text ('{0} EXCEPTION {1}: {2}（此后 60 秒内同类不再记录）' -f (Get-Date -Format 'HH:mm:ss'),
+                        $_.Exception.GetType().Name, $_.Exception.Message)
                 }
             # 【故意静默】失败无害，下个周期会自动重试
             } catch { }
@@ -7204,6 +7539,57 @@ function Export-DiagnosticPackage {
             } catch {
                 $skipped += ((Split-Path -Leaf $ls.Src) + '（读取失败）')
             }
+        }
+
+        # ---- ①之二：判色调试日志（D4 新增，用户拍板）
+        #
+        # 【为什么以前不收，现在要收】
+        #   原来这份日志根本没进诊断包。于是用户报"字色不对/白字"时，
+        #   我们拿到的包里**恰好没有判色过程** —— 只能猜是抓屏失败、
+        #   句柄失效、还是样本太少被跳过。而 panel-debug.log 里这三类
+        #   各有一行明确记录（CAPTURE-FAIL / EXCEPTION / glassLum => 白字）。
+        #
+        # 【为什么只收尾部】
+        #   用户拍板：主 debug 尾部 + 最近 1 个轮转的尾部。
+        #   理由是排障只需要"出事前后那几百行"，
+        #   而 debug 日志本来就密（900ms 一次），整份收进来会让诊断包
+        #   从几十 KB 涨到几 MB，用户传起来费劲、我们也看不完。
+        #
+        # 【⚠️ 只在调试开关开着时才收】
+        #   没开调试时这个文件可能根本不存在（或只有很旧的内容）。
+        #   不存在就安静跳过，不进 skipped 列表 —— 否则用户会看到
+        #   "panel-debug.log（不存在）"这种让人以为出问题的字样。
+        if ($script:debugOn -or (Test-Path (Join-Path $DataDir 'panel-debug.log'))) {
+            try {
+                $debugSrc = Join-Path $DataDir 'panel-debug.log'
+                if (Test-Path $debugSrc) {
+                    # 尾部 800 行：判色是 900ms 一行，800 行约等于最近 12 分钟，
+                    # 足够覆盖"我发现白了然后导出诊断包"这个时间差。
+                    $dtail = @(Get-Content $debugSrc -Tail 800 -Encoding UTF8 -ErrorAction Stop)
+                    [System.IO.File]::WriteAllLines((Join-Path $work 'panel-debug.log'), $dtail,
+                        (New-Object System.Text.UTF8Encoding($false)))
+                    $collected += 'panel-debug.log'
+                }
+            } catch {
+                $skipped += 'panel-debug.log（读取失败）'
+            }
+
+            # 最近 1 个 debug 轮转（再往前一般用不上，也为了控制包体积）
+            try {
+                $drot = @(Get-ChildItem -Path $DataDir -Filter 'panel-debug.*.log' -File -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -match '^panel-debug\.\d{8}-\d{6}(-\d+)?\.log$' } |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+                foreach ($r in $drot) {
+                    try {
+                        $rt = @(Get-Content $r.FullName -Tail 400 -Encoding UTF8 -ErrorAction Stop)
+                        [System.IO.File]::WriteAllLines((Join-Path $work $r.Name), $rt,
+                            (New-Object System.Text.UTF8Encoding($false)))
+                        $collected += $r.Name
+                    } catch {
+                        $skipped += ($r.Name + '（读取失败）')
+                    }
+                }
+            } catch { }
         }
 
         # 历史轮转日志也带上（能反映前几天的情况）

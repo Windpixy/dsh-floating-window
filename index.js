@@ -18,7 +18,10 @@ import { StateWriter } from './lib/writer.js'
 import { DEFAULTS, dataDir, dataPaths, panelDir } from './lib/paths.js'
 import { createLogger } from './lib/logger.js'
 import { registerSources, backfill, syncExistingSessions } from './lib/sources.js'
-import { ensureCardRunning, checkHeartbeat, shouldReviveCard, judgeCardStaleness, shouldRestartForUpdate, readPanelStampMs, stopCardByHeartbeat, waitForPreviousCardExit } from './lib/launcher.js'
+// 【D6】isProcessAlive 加进来是为了在监控循环里核对"心跳里那个 pid 还在不在"。
+//   过去只有 ensureCardRunning 的首次拉起会做这一步（本文件下方 verifyPid: true），
+//   每 5 秒跑的监控循环从来没核对过 —— 那正是"一张卡片变三张"的根因。
+import { ensureCardRunning, checkHeartbeat, shouldReviveCard, isProcessAlive, judgeCardStaleness, shouldRestartForUpdate, readPanelStampMs, stopCardByHeartbeat, waitForPreviousCardExit } from './lib/launcher.js'
 import { startDemo } from './lib/demo.js'
 import { HolidayStore, nextSwitch } from './lib/valley.js'
 import { createApprovalProxy } from './lib/approval-proxy.js'
@@ -106,6 +109,69 @@ export const name = 'dsh-floating-window'
  */
 export const inject = ['timer']
 
+// ================================================================ 配置日志白名单（D4）
+//
+// 【原来是什么问题】
+//   启动时直接 log(`配置: ${JSON.stringify(cfg)}`) —— 把**整份配置**原样写进
+//   plugin.log。今天这 11 个字段都无害，但这是一条**未来会出事**的写法：
+//   哪天加一个 apiKey / webhookToken / password 之类的配置项，
+//   它会被自动写进磁盘上的明文日志，而且没人会注意到 ——
+//   因为"配置行"本来就一直在那儿，看着很正常。
+//   这类问题等到发现时通常已经泄露很久了。
+//
+// 【改成什么样】
+//   只记**排障真的会用到**的字段（下面这张表），其余一律不出现。
+//   以后新增配置，默认**不记**；要看它就主动加进这张表。
+//   这是"默认安全"而不是"记得手删"——两者的差别在于一年后还对不对。
+//
+// 【为什么还要 isSensitiveKey 这层兜底】
+//   白名单本身也可能出错：有人图省事往表里加个 token 字段。
+//   所以再加一道**按名字**的过滤，命中就无条件不记（连"已隐藏"都不说，
+//   免得日志里出现 `apiKey=***` 反而提示"这里有东西"）。
+//   两道闸独立生效：白名单管"记不记"，敏感名管"哪怕在名单里也不记"。
+const LOG_SAFE_CFG_KEYS = [
+  'autoLaunch',
+  'useDemoData',
+  'showSubagentSessions',
+  'writeThrottleMs',
+  'backfillTodayTokens',
+  'heartbeatStaleMs',
+  'approvalDecisionTtlMs',
+  'approvalPollMs',
+  'approvalInline',
+]
+
+/** 名字里出现这些词就绝不记录（大小写无关） */
+const SENSITIVE_KEY_RE = /token|secret|password|passwd|credential|apikey|api_key|private|auth|cookie/i
+
+/**
+ * 把配置压成一行"可安全写日志"的文本。
+ *
+ * 【为什么不返回对象】
+ *   返回值直接拼进日志行。返回对象的话调用方还得自己 stringify，
+ *   于是很容易又写回 `JSON.stringify(cfg)` 的老路。
+ *   返回成品字符串，调用点只有一种写法，想写错都难。
+ *
+ * @param {Record<string, unknown>} cfg
+ * @returns {string} 形如 `autoLaunch=true useDemoData=false ...`
+ */
+export function summarizeConfigForLog(cfg) {
+  const parts = []
+  for (const key of LOG_SAFE_CFG_KEYS) {
+    // 双保险：白名单里的字段也要过一遍敏感名过滤
+    if (SENSITIVE_KEY_RE.test(key)) continue
+    // 只记录"自己确实说过"的字段。没配置的值不该以 undefined 出现在日志里，
+    // 那会让人误以为"系统读到了 undefined"，实际是"根本没设置"。
+    if (!Object.prototype.hasOwnProperty.call(cfg || {}, key)) continue
+    const v = cfg[key]
+    if (v === undefined) continue
+    // 值本身也要防一手：万一是对象/数组，打出来可能很长甚至含嵌套凭据
+    if (v !== null && typeof v === 'object') continue
+    parts.push(`${key}=${String(v)}`)
+  }
+  return parts.length ? parts.join(' ') : '(无可记录字段)'
+}
+
 export function apply(ctx, config) {
   const cfg = { ...DEFAULTS, ...(config ?? {}) }
 
@@ -118,7 +184,9 @@ export function apply(ctx, config) {
   log(`插件启动 v${pkgVersion}（插件只写数据，卡片独立渲染；卡片掉线会自动复活）`)
   log(`dataDir=${dir}`)
   log(`panelDir=${cardDir}`)
-  log(`配置: ${JSON.stringify(cfg)}`)
+  // 【D4】不再 JSON.stringify(cfg) 整份输出，只记白名单里的排障字段。
+  //   dataDir / panelDir 上面已经单独记过了，不在这张表里也不会丢信息。
+  log(`配置: ${summarizeConfigForLog(cfg)}`)
 
   // ---------------------------------------------------------------- 核心状态
   const state = new CardState({
@@ -612,6 +680,32 @@ export function apply(ctx, config) {
     // 已经为哪个时间戳写过"这种情况不处理"的日志（避免每 5 秒刷一条）
     let alreadyHandledLoggedAt = 0
 
+    // ---------------------------------------------------------- 【D6】pid 存活探测
+    //
+    // 【这个函数存在的唯一理由：把"判断不了"和"确定还活着"分开】
+    //   launcher.js 里的 isProcessAlive 已经能区分三种结果，但直接调用它
+    //   有个坑：它接受 undefined/NaN 并返回 null，而 pid 可能从心跳里拿到
+    //   各种奇怪的值（字符串、负数、缺失）。这里做一层薄封装，保证：
+    //     · 心跳里没有 pid（极老版本卡片）→ undefined
+    //         （让 shouldReviveCard 保持旧行为，不因为"没 pid"就拒绝救命）
+    //     · pid 有值且查得到 → true / false
+    //     · 查的时候抛异常 → null（判断不了，保守不拉起）
+    //
+    // 【为什么没有 pid 要返回 undefined 而不是 null】
+    //   null 会被 shouldReviveCard 当成"判断不了 → 保守不拉起"。
+    //   但"心跳里根本没记 pid"是**老卡片的正常形态**，不是权限问题。
+    //   对它保守不拉起，等于让老版本用户的卡片永远不被自动救活 ——
+    //   这是比叠卡更难受的故障。所以返回 undefined，走旧逻辑照常救。
+    const probePidAliveSafely = (rawPid) => {
+      const n = Number(rawPid)
+      if (!Number.isFinite(n) || n <= 0) return undefined
+      try {
+        return isProcessAlive(n)
+      } catch {
+        return null
+      }
+    }
+
     // ---------------------------------------------------------- 旧代码自动重启（v0.9.12）
     //
     // 【为什么要做】
@@ -759,6 +853,24 @@ export function apply(ctx, config) {
           maxRevive: MAX_REVIVE,
           autoLaunch: cfg.autoLaunch === true,
           reviving,
+          // ================================================================
+          // 【D6 · 2026-11-03】把"那个 pid 现在还在不在"告诉 shouldReviveCard
+          //
+          // 【为什么必须在这里补这一句 —— 真实事故】
+          //   本机曾同时跑着 3 张卡片，翻 plugin.log 才看清根因：
+          //   旧卡片（pid 25260）**从未退出**，只是有段时间没写心跳，
+          //   而这里把"心跳过期"当成了"卡片没了"，5 秒一轮地不断补新的，
+          //   于是 11:21 / 11:40 / 12:27 各补了一张，越补越多。
+          //
+          // 【为什么只在 crashed 时才真的去查】
+          //   verifyHeartbeatPid 要调一次系统接口（process.kill(pid, 0)），
+          //   虽然很便宜，但没必要每 5 秒对每种情况都调。
+          //   只有"心跳过期"这一种情况才需要区分"崩溃了"和"只是没写心跳"，
+          //   其他分支（用户主动退出 / 情况不明）本来就不用 pid 结论。
+          //
+          // 【返回值的三种含义】见 probePidAlive 的注释
+          // ================================================================
+          pidAlive: hb.crashed === true ? probePidAliveSafely(hb.pid) : undefined,
         })
 
         // ----------------------------------------------------------------

@@ -202,9 +202,30 @@ function Invoke-SettingsLogMaintenance {
                     # 改名失败（多半是被占用）就退一步：清空主文件。
                     # 宁可丢历史，也不能让主文件无限长下去 —— 磁盘写满会让设置窗口
                     # 出现更莫名其妙的问题，而日志本身是最不值钱的东西。
-                    # 【C 档：故意静默】这是"已经很坏的处境"里的最后一道兜底，
-                    # 清空也失败就只能等下次；在这里写日志属于套娃（还在同一个失败路径上）。
-                    try { [System.IO.File]::WriteAllText($script:SettingsLog, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+                    #
+                    # 【D4：清空前先记下丢了多少，事后要能说清】
+                    #   原来是纯静默的：用户事后只会发现"settings.log 忽然短了"，
+                    #   不知道丢的是哪一段、为什么丢。而这正是最需要证据的时刻
+                    #   （改名失败说明有别的程序在抢这个文件）。
+                    #   用户拍板：留一句 WARN，写清时间/原因/丢了多大。
+                    #
+                    # 【⚠️ 必须用 AppendAllText，不能用 Write-SettingsLog】
+                    #   Write-SettingsLog 写完会再调 Invoke-SettingsLogMaintenance，
+                    #   而我们现在正**在这个维护函数里面** —— 那就成了
+                    #   维护→写日志→维护→写日志 的无限递归，设置窗口会栈溢出崩掉。
+                    #   所以这里直接写文件，绕开日志入口。
+                    $lostKb = 0
+                    try {
+                        $lostBytes = (Get-Item -LiteralPath $script:SettingsLog -ErrorAction SilentlyContinue).Length
+                        if ($null -ne $lostBytes) { $lostKb = [int]($lostBytes / 1024) }
+                    } catch { }
+                    try {
+                        $warnTs = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+                        $warnLine = ('[{0}] [SETTINGS] [WARN] 日志轮转失败（settings.old.log 被占用），已清空 settings.log，丢失约 {1} KB 历史；常见原因是杀毒/备份软件正在读取该文件' -f $warnTs, $lostKb) + "`r`n"
+                        [System.IO.File]::WriteAllText($script:SettingsLog, $warnLine, (New-Object System.Text.UTF8Encoding($false)))
+                    } catch {
+                        # 【C 档：故意静默】连写入这句告警都失败，就没别的办法了
+                    }
                 }
             }
         }
